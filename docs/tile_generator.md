@@ -313,6 +313,24 @@ The folder name is the WSI filename without extension. Existing completed WSI
 folders are skipped automatically. Use `--force` to remove and regenerate a WSI
 output folder.
 
+If a job is interrupted before a WSI finishes, rerun the same command without
+`--force`. The runner treats that WSI as partial output, recomputes the expected
+tile coordinates, validates existing tile images, skips valid coordinate-named
+tiles, regenerates missing or corrupt files, rewrites metadata/visualizations,
+and then writes `_COMPLETED.json`.
+
+Relevant resume settings:
+
+```yaml
+saving:
+  resume: true
+  validate_existing_tiles: true
+  atomic_writes: true
+
+batch:
+  resume_partial: true
+```
+
 After all WSIs finish, the runner writes:
 
 ```text

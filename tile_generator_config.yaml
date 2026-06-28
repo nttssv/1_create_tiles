@@ -77,6 +77,10 @@ saving:
   jpeg_quality: 95
   # Resume skips existing deterministic tile filenames instead of regenerating.
   resume: true
+  # Validate existing tile images before skipping them during resume.
+  validate_existing_tiles: true
+  # Write tiles through a temporary file then atomically replace the final path.
+  atomic_writes: true
   overwrite: false
   filename_prefix: tile
   # Keep false for stable cross-model IDs: tile_x18432_y22528.png.
@@ -110,6 +114,8 @@ batch:
   force: false
   # Parallelize across WSIs. Each worker opens its own slide.
   workers: 1
+  # If a slide folder exists but is incomplete, continue and skip valid existing tiles.
+  resume_partial: true
 
 logging:
   level: INFO

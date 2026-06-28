@@ -55,6 +55,11 @@ are skipped automatically and `output/batch_summary.csv` is updated.
 Parallel workers run at the WSI level; each worker opens its own slide and
 writes to a dedicated output folder.
 
+If a run stops mid-slide, run the same command again without `--force`. The
+batch runner will re-enter the partial slide folder, validate existing tile
+images, skip valid files, regenerate missing/corrupt files, and then write the
+completion marker.
+
 ## Direct API
 
 ```python

@@ -107,6 +107,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "jpeg_quality": 95,
         "overwrite": False,
         "resume": True,
+        "validate_existing_tiles": True,
+        "atomic_writes": True,
         "filename_prefix": "tile",
         "include_component_id": False,
     },
@@ -134,6 +136,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "batch_summary_filename": "batch_summary.csv",
         "force": False,
         "workers": 1,
+        "resume_partial": True,
     },
     "logging": {
         "level": "INFO",
@@ -869,6 +872,8 @@ def save_tiles(
     jpeg_quality: int = 95,
     overwrite: bool = True,
     resume: bool = False,
+    validate_existing_tiles: bool = True,
+    atomic_writes: bool = True,
     filename_prefix: str = "tile",
     include_component_id: bool = False,
     progress_callback: Callable[[int, int, str], None] | None = None,
@@ -895,13 +900,16 @@ def save_tiles(
         tile.path = path
         tile.skipped_existing = False
         if path.exists() and resume:
-            tile.skipped_existing = True
-            saved_paths.append(path)
-            if progress_callback:
-                progress_callback(index, total, progress_label)
-            continue
+            if not validate_existing_tiles or _is_existing_tile_valid(path, (tile.width, tile.height)):
+                tile.skipped_existing = True
+                saved_paths.append(path)
+                if progress_callback:
+                    progress_callback(index, total, progress_label)
+                continue
+            LOGGER.warning("Existing tile is invalid and will be regenerated: %s", path)
         if path.exists() and not overwrite:
-            raise TileGenerationError(f"Refusing to overwrite existing tile: {path}")
+            if not resume:
+                raise TileGenerationError(f"Refusing to overwrite existing tile: {path}")
         image = slide.read_region((tile.x, tile.y), 0, (tile.width, tile.height)).convert("RGB")
         if image.size != (tile.width, tile.height):
             raise TileGenerationError(
@@ -912,7 +920,7 @@ def save_tiles(
         if ext in {"jpg", "jpeg"}:
             save_kwargs["quality"] = int(jpeg_quality)
             save_kwargs["subsampling"] = 0
-        image.save(path, **save_kwargs)
+        _save_image_atomic(image, path, atomic_writes=atomic_writes, save_kwargs=save_kwargs)
         saved_paths.append(path)
         if progress_callback:
             progress_callback(index, total, progress_label)
@@ -1281,6 +1289,8 @@ def generate_tiles(
                 jpeg_quality=int(saving_cfg.get("jpeg_quality", 95)),
                 overwrite=bool(saving_cfg.get("overwrite", False)),
                 resume=bool(saving_cfg.get("resume", True)),
+                validate_existing_tiles=bool(saving_cfg.get("validate_existing_tiles", True)),
+                atomic_writes=bool(saving_cfg.get("atomic_writes", True)),
                 filename_prefix=filename_prefix,
                 include_component_id=include_component_id,
                 progress_callback=_combined_progress,
@@ -1295,6 +1305,8 @@ def generate_tiles(
                     jpeg_quality=int(saving_cfg.get("jpeg_quality", 95)),
                     overwrite=bool(saving_cfg.get("overwrite", False)),
                     resume=bool(saving_cfg.get("resume", True)),
+                    validate_existing_tiles=bool(saving_cfg.get("validate_existing_tiles", True)),
+                    atomic_writes=bool(saving_cfg.get("atomic_writes", True)),
                     filename_prefix=filename_prefix,
                     include_component_id=include_component_id,
                     progress_callback=_combined_progress,
@@ -1442,6 +1454,7 @@ def process_wsi_batch(
     base_config = load_config(config_path)
     if config:
         base_config = _deep_merge(base_config, dict(config))
+    setup_logging(base_config.get("logging", {}).get("level", "INFO"))
 
     input_path = Path(input_dir)
     output_path = Path(output_dir)
@@ -1454,6 +1467,7 @@ def process_wsi_batch(
     marker_name = str(batch_cfg.get("completed_marker", "_COMPLETED.json"))
     effective_force = bool(force or batch_cfg.get("force", False))
     worker_count = max(1, int(workers or batch_cfg.get("workers", 1) or 1))
+    resume_partial = bool(batch_cfg.get("resume_partial", True))
     if slide_factory is not None and worker_count > 1:
         LOGGER.warning("slide_factory was provided; falling back to one worker for safe testing.")
         worker_count = 1
@@ -1471,6 +1485,7 @@ def process_wsi_batch(
                 base_config=base_config,
                 marker_name=marker_name,
                 force=effective_force,
+                resume_partial=resume_partial,
                 return_images=return_images,
                 slide_factory=slide_factory,
                 show_tile_progress=show_progress,
@@ -1496,6 +1511,7 @@ def process_wsi_batch(
                     _json_safe(base_config),
                     marker_name,
                     effective_force,
+                    resume_partial,
                     return_images,
                 )
                 futures[future] = (index, slide_path)
@@ -1539,6 +1555,7 @@ def _process_batch_slide_item_worker(
     base_config: Mapping[str, Any],
     marker_name: str,
     force: bool,
+    resume_partial: bool,
     return_images: bool,
 ) -> tuple[int, BatchSlideResult]:
     result = _process_batch_slide_item(
@@ -1548,6 +1565,7 @@ def _process_batch_slide_item_worker(
         base_config=base_config,
         marker_name=marker_name,
         force=force,
+        resume_partial=resume_partial,
         return_images=return_images,
         slide_factory=None,
         show_tile_progress=False,
@@ -1563,6 +1581,7 @@ def _process_batch_slide_item(
     base_config: Mapping[str, Any],
     marker_name: str,
     force: bool,
+    resume_partial: bool,
     return_images: bool,
     slide_factory: Callable[[Path], Any] | None,
     show_tile_progress: bool,
@@ -1582,10 +1601,23 @@ def _process_batch_slide_item(
 
     if force and slide_output_dir.exists():
         shutil.rmtree(slide_output_dir)
+    elif slide_output_dir.exists() and not resume_partial:
+        return BatchSlideResult(
+            wsi_filename=slide_path.name,
+            slide_name=slide_name,
+            output_dir=slide_output_dir,
+            completion_timestamp=_timestamp(),
+            status="Failed",
+            error=(
+                "Partial output exists and batch.resume_partial is false. "
+                "Use --force to restart or enable resume_partial."
+            ),
+        )
 
     _create_slide_output_layout(slide_output_dir)
     slide_config = _build_batch_slide_config(base_config, slide_path, slide_output_dir)
     _write_config_snapshot(slide_config, slide_output_dir / "logs" / "configuration_snapshot.yaml")
+    existing_counts = _count_existing_slide_tiles(slide_config, slide_output_dir)
     tile_progress_holder: dict[str, ProgressPrinter] = {}
 
     def _tile_progress(current: int, total: int, label: str) -> None:
@@ -1604,6 +1636,13 @@ def _process_batch_slide_item(
     try:
         with _slide_file_logging(slide_output_dir / "logs" / "processing.log"):
             LOGGER.info("Starting WSI batch item: %s", slide_path)
+            if existing_counts["total"] > 0:
+                LOGGER.info(
+                    "Resuming partial output for %s: %s accepted files, %s rejected files already exist.",
+                    slide_path.name,
+                    existing_counts["accepted"],
+                    existing_counts["rejected"],
+                )
             slide_obj = slide_factory(slide_path) if slide_factory else None
             try:
                 tile_results = generate_tiles(
@@ -1778,6 +1817,25 @@ def _is_slide_completed(slide_output_dir: Path, marker_name: str) -> bool:
     metadata = slide_output_dir / "metadata" / "tile_metadata.csv"
     coordinates = slide_output_dir / "metadata" / "tile_coordinates.csv"
     return marker.exists() or (metadata.exists() and coordinates.exists())
+
+
+def _count_existing_slide_tiles(config: Mapping[str, Any], slide_output_dir: Path) -> dict[str, int]:
+    saving_cfg = config.get("saving", {})
+    accepted_dir = slide_output_dir / str(saving_cfg.get("accepted_tiles_subdir", "tiles/accepted_tiles"))
+    rejected_dir = slide_output_dir / str(saving_cfg.get("rejected_tiles_subdir", "tiles/rejected_tiles"))
+    accepted = _count_tile_files(accepted_dir)
+    rejected = _count_tile_files(rejected_dir)
+    return {"accepted": accepted, "rejected": rejected, "total": accepted + rejected}
+
+
+def _count_tile_files(directory: Path) -> int:
+    if not directory.exists():
+        return 0
+    return sum(
+        1
+        for path in directory.iterdir()
+        if path.is_file() and not path.name.startswith(".") and not path.name.startswith("._")
+    )
 
 
 def _read_completion_marker(marker_path: Path) -> dict[str, Any]:
@@ -2404,6 +2462,34 @@ def _assign_tile_paths(
             prefix=filename_prefix,
             include_component_id=include_component_id,
         )
+
+
+def _is_existing_tile_valid(path: Path, expected_size: tuple[int, int]) -> bool:
+    try:
+        with Image.open(path) as image:
+            if image.size != expected_size:
+                return False
+            image.verify()
+        return True
+    except Exception:
+        return False
+
+
+def _save_image_atomic(
+    image: Image.Image,
+    path: Path,
+    atomic_writes: bool,
+    save_kwargs: Mapping[str, Any],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not atomic_writes:
+        image.save(path, **dict(save_kwargs))
+        return
+    tmp_path = path.with_name(f".{path.stem}.tmp{path.suffix}")
+    with contextlib.suppress(FileNotFoundError):
+        tmp_path.unlink()
+    image.save(tmp_path, **dict(save_kwargs))
+    tmp_path.replace(path)
 
 
 def _tile_metadata(tile: TileRecord) -> dict[str, Any]:
