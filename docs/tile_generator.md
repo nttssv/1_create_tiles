@@ -184,6 +184,11 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+The default `slide_backend: auto` mode opens slides with OpenSlide first and
+falls back to `tiffslide` for generic TIFF/OME-TIFF files that OpenSlide cannot
+recognize. Use `--slide-backend openslide` to require OpenSlide only, or
+`--slide-backend tiffslide` to test the fallback reader directly.
+
 Run with the config:
 
 ```bash
@@ -285,6 +290,7 @@ python -m tile_generator \
   --input-dir raw_images \
   --output-dir output \
   --workers 4 \
+  --slide-backend auto \
   --progress-every-tiles 100 \
   --progress-interval-seconds 2
 ```

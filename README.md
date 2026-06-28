@@ -22,6 +22,10 @@ pip install -r requirements.txt
 python -m tile_generator --config tile_generator_config.yaml --slide /path/to/patient.svs
 ```
 
+Slide reading defaults to `slide_backend: auto`: OpenSlide is tried first, then
+`tiffslide` is used for generic TIFF/OME-TIFF files that OpenSlide reports as
+unsupported.
+
 Outputs are written under `tile_output/` by default:
 
 - `accepted_tiles/`: accepted native 512x512 level-0 crops named `tile_x18432_y22528.png`
@@ -38,6 +42,7 @@ python -m tile_generator \
   --input-dir raw_images \
   --output-dir output \
   --workers 4 \
+  --slide-backend auto \
   --progress-every-tiles 100 \
   --progress-interval-seconds 2
 ```

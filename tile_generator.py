@@ -43,6 +43,11 @@ try:
 except ImportError:  # pragma: no cover - optional dependency guard
     openslide = None
 
+try:
+    import tiffslide
+except ImportError:  # pragma: no cover - optional dependency guard
+    tiffslide = None
+
 
 LOGGER = logging.getLogger(__name__)
 COORDINATE_FILENAME_RE = re.compile(
@@ -54,6 +59,7 @@ TILE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "slide_path": None,
+    "slide_backend": "auto",
     "output_dir": "tile_output",
     "roi_mode": "auto",
     "manual_roi": None,
@@ -1221,7 +1227,7 @@ def generate_tiles(
         slide_path = cfg.get("slide_path")
         if not slide_path:
             raise TileGenerationError("Set slide_path in the config or pass a slide object.")
-        slide_obj, close_slide = _open_slide(slide_path)
+        slide_obj, close_slide = _open_slide(slide_path, backend=str(cfg.get("slide_backend", "auto")))
 
     try:
         slide_dimensions = _slide_dimensions(slide_obj)
@@ -2555,6 +2561,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="YAML config path.",
     )
     parser.add_argument("--slide", help="Override slide_path from the config.")
+    parser.add_argument(
+        "--slide-backend",
+        choices=["auto", "openslide", "tiffslide"],
+        help="Slide reader backend. auto tries OpenSlide then tiffslide.",
+    )
     parser.add_argument("--output-dir", help="Override output_dir from the config.")
     parser.add_argument("--input-dir", help="Batch input directory containing .tif/.tiff WSIs.")
     parser.add_argument("--qc-output-dir", help="Run QC on a batch output directory and exit.")
@@ -2598,6 +2609,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch_overrides.setdefault("batch", {})[
                 "progress_update_interval_seconds"
             ] = args.progress_interval_seconds
+        if args.slide_backend:
+            batch_overrides["slide_backend"] = args.slide_backend
         process_wsi_batch(
             input_dir=batch_input_dir,
             output_dir=batch_output_dir,
@@ -2613,6 +2626,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     overrides: dict[str, Any] = {}
     if args.slide:
         overrides["slide_path"] = args.slide
+    if args.slide_backend:
+        overrides["slide_backend"] = args.slide_backend
     if args.output_dir:
         overrides["output_dir"] = args.output_dir
 
@@ -2626,16 +2641,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _open_slide(slide_path: str | Path) -> tuple[Any, bool]:
-    if openslide is None:
-        raise TileGenerationError(
-            "openslide-python is required to open WSI files. Install openslide-python "
-            "and the OpenSlide shared library, or pass an OpenSlide-like object."
-        )
+def _open_slide(slide_path: str | Path, backend: str = "auto") -> tuple[Any, bool]:
     path = Path(slide_path)
     if not path.exists():
         raise TileGenerationError(f"Slide path does not exist: {path}")
-    return openslide.OpenSlide(str(path)), True
+
+    selected_backend = str(backend or "auto").lower()
+    if selected_backend not in {"auto", "openslide", "tiffslide"}:
+        raise TileGenerationError("slide_backend must be one of: auto, openslide, tiffslide.")
+
+    errors: list[str] = []
+    if selected_backend in {"auto", "openslide"}:
+        if openslide is None:
+            errors.append("OpenSlide unavailable: openslide-python is not installed")
+        else:
+            try:
+                slide = openslide.OpenSlide(str(path))
+                LOGGER.info("Opened slide with OpenSlide backend: %s", path)
+                return slide, True
+            except Exception as exc:  # noqa: BLE001 - fallback to tiffslide if configured
+                errors.append(f"OpenSlide failed: {exc!r}")
+                if selected_backend == "openslide":
+                    raise TileGenerationError("; ".join(errors)) from exc
+
+    if selected_backend in {"auto", "tiffslide"}:
+        if tiffslide is None:
+            errors.append("tiffslide unavailable: install tiffslide to read generic TIFF/OME-TIFF WSIs")
+        else:
+            try:
+                slide = tiffslide.TiffSlide(str(path))
+                LOGGER.info("Opened slide with tiffslide backend: %s", path)
+                return slide, True
+            except Exception as exc:  # noqa: BLE001 - report both backend errors
+                errors.append(f"tiffslide failed: {exc!r}")
+                if selected_backend == "tiffslide":
+                    raise TileGenerationError("; ".join(errors)) from exc
+
+    raise TileGenerationError(f"Unable to open slide {path}. " + "; ".join(errors))
 
 
 def _deep_copy(value: Any) -> Any:
