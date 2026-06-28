@@ -37,7 +37,9 @@ python -m tile_generator \
   --config tile_generator_config.yaml \
   --input-dir raw_images \
   --output-dir output \
-  --workers 4
+  --workers 4 \
+  --progress-every-tiles 100 \
+  --progress-interval-seconds 2
 ```
 
 Each WSI gets its own folder:
@@ -54,6 +56,8 @@ Use `--force` to overwrite a completed WSI output. Otherwise, completed slides
 are skipped automatically and `output/batch_summary.csv` is updated.
 Parallel workers run at the WSI level; each worker opens its own slide and
 writes to a dedicated output folder.
+The terminal progress display updates while tiles are saved or skipped,
+including the last coordinate-named tile file handled by each active worker.
 
 If a run stops mid-slide, run the same command again without `--force`. The
 batch runner will re-enter the partial slide folder, validate existing tile

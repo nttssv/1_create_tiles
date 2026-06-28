@@ -116,6 +116,9 @@ batch:
   workers: 1
   # If a slide folder exists but is incomplete, continue and skip valid existing tiles.
   resume_partial: true
+  # Terminal progress updates are throttled so large WSI jobs do not spam logs.
+  progress_update_every_tiles: 100
+  progress_update_interval_seconds: 2.0
 
 logging:
   level: INFO

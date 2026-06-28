@@ -284,7 +284,9 @@ python -m tile_generator \
   --config tile_generator_config.yaml \
   --input-dir raw_images \
   --output-dir output \
-  --workers 4
+  --workers 4 \
+  --progress-every-tiles 100 \
+  --progress-interval-seconds 2
 ```
 
 For each WSI, the batch runner creates:
@@ -329,6 +331,8 @@ saving:
 
 batch:
   resume_partial: true
+  progress_update_every_tiles: 100
+  progress_update_interval_seconds: 2.0
 ```
 
 After all WSIs finish, the runner writes:
@@ -341,11 +345,11 @@ The batch summary has one row per WSI with filename, accepted tiles, rejected
 tiles, total tiles, tissue area, processing time, completion timestamp, status,
 output folder, and any error message.
 
-Batch mode prints an overall WSI progress bar and a per-WSI tile-generation
-progress bar while accepted/rejected tile files are written. With
-`--workers > 1`, progress is reported at the WSI-completion level to avoid
-multiple processes writing overlapping terminal bars; each slide still writes
-its own `logs/processing.log`.
+Batch mode prints an overall WSI progress bar while accepted/rejected tile files
+are written. With `--workers > 1`, worker processes send throttled progress
+events back to the main process, so the terminal shows active WSIs, tile counts,
+and the last coordinate-named tile file saved or skipped by each worker. Each
+slide also writes its own `logs/processing.log`.
 
 Parallelization is across WSIs, not within a single WSI. Each worker opens its
 own OpenSlide handle and writes to a dedicated slide output folder.
