@@ -30,6 +30,28 @@ Outputs are written under `tile_output/` by default:
 - `patient_tile_map.png`: overview of mask, components, ROI, and tile filtering
 - `tile_statistics.json`: run-level counts and timing
 
+Batch mode:
+
+```bash
+python -m tile_generator \
+  --config tile_generator_config.yaml \
+  --input-dir raw_images \
+  --output-dir output
+```
+
+Each WSI gets its own folder:
+
+```text
+output/26RR000079-A-01-01/
+  tiles/
+  metadata/
+  visualization/
+  logs/
+```
+
+Use `--force` to overwrite a completed WSI output. Otherwise, completed slides
+are skipped automatically and `output/batch_summary.csv` is updated.
+
 ## Direct API
 
 ```python

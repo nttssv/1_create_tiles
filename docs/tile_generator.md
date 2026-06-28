@@ -234,6 +234,8 @@ Metadata CSV:
 
 ```text
 tile_output/tile_metadata.csv
+tile_output/tile_coordinates.csv
+tile_output/tile_summary.csv
 ```
 
 CSV columns:
@@ -246,6 +248,7 @@ Overview image:
 
 ```text
 tile_output/patient_tile_map.png
+tile_output/tissue_mask.png
 ```
 
 Statistics JSON:
@@ -271,6 +274,56 @@ The script writes:
 ```text
 docs/patient_tile_map_example.png
 ```
+
+## Batch Processing
+
+Process an entire folder of `.tif` and `.tiff` WSIs in alphabetical order:
+
+```bash
+python -m tile_generator \
+  --config tile_generator_config.yaml \
+  --input-dir raw_images \
+  --output-dir output
+```
+
+For each WSI, the batch runner creates:
+
+```text
+output/
+  26RR000079-A-01-01/
+    tiles/
+      accepted_tiles/
+      rejected_tiles/
+    metadata/
+      tile_metadata.csv
+      tile_coordinates.csv
+      tile_summary.csv
+      tile_statistics.json
+    visualization/
+      patient_tile_map.png
+      tissue_mask.png
+    logs/
+      processing.log
+      configuration_snapshot.yaml
+    _COMPLETED.json
+```
+
+The folder name is the WSI filename without extension. Existing completed WSI
+folders are skipped automatically. Use `--force` to remove and regenerate a WSI
+output folder.
+
+After all WSIs finish, the runner writes:
+
+```text
+output/batch_summary.csv
+```
+
+The batch summary has one row per WSI with filename, accepted tiles, rejected
+tiles, total tiles, tissue area, processing time, completion timestamp, status,
+output folder, and any error message.
+
+Batch mode prints an overall WSI progress bar and a per-WSI tile-generation
+progress bar while accepted/rejected tile files are written.
 
 ## Multiprocessing Notes
 

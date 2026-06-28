@@ -5,3 +5,4 @@ __pycache__/
 
 tile_output/
 tmp_*_smoke/
+tmp_batch_*/

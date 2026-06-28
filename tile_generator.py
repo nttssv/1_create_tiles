@@ -9,15 +9,18 @@ size; thumbnail images are used only for tissue detection and tile filtering.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
+import datetime as dt
 import json
 import logging
 import math
+import shutil
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
 
 import numpy as np
 from PIL import Image
@@ -42,6 +45,7 @@ LOGGER = logging.getLogger(__name__)
 COORDINATE_FILENAME_RE = re.compile(
     r"^[A-Za-z0-9-]+_x(?P<x>-?\d+)_y(?P<y>-?\d+)(?:_c(?P<c>\d+))?(?:_[A-Za-z0-9-]+)?\.[^.]+$"
 )
+SUPPORTED_WSI_EXTENSIONS = {".tif", ".tiff"}
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -107,9 +111,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "metadata": {
         "filename": "tile_metadata.csv",
+        "coordinates_filename": "tile_coordinates.csv",
+        "summary_filename": "tile_summary.csv",
     },
     "visualization": {
         "filename": "patient_tile_map.png",
+        "tissue_mask_filename": "tissue_mask.png",
         "dpi": 160,
         "max_tiles_to_draw": None,
         "draw_tile_labels": True,
@@ -118,6 +125,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "statistics": {
         "filename": "tile_statistics.json",
+    },
+    "batch": {
+        "input_dir": None,
+        "output_dir": "output",
+        "completed_marker": "_COMPLETED.json",
+        "batch_summary_filename": "batch_summary.csv",
+        "force": False,
     },
     "logging": {
         "level": "INFO",
@@ -216,6 +230,57 @@ class GeneratedTile:
     metadata: dict[str, Any]
     path: Path | None = None
     skipped_existing: bool = False
+
+
+@dataclass
+class BatchSlideResult:
+    """One WSI row for batch summaries."""
+
+    wsi_filename: str
+    slide_name: str
+    output_dir: Path
+    accepted_tiles: int = 0
+    rejected_tiles: int = 0
+    total_tiles: int = 0
+    tissue_area: int = 0
+    processing_time_seconds: float = 0.0
+    completion_timestamp: str = ""
+    status: str = "Pending"
+    error: str = ""
+
+
+class ProgressPrinter:
+    """Small terminal progress helper with no external dependency."""
+
+    def __init__(self, label: str, total: int, width: int = 24, enabled: bool = True) -> None:
+        self.label = label
+        self.total = max(0, int(total))
+        self.width = max(10, int(width))
+        self.enabled = enabled
+        self.start_time = time.perf_counter()
+        self.current = 0
+
+    def update(self, current: int, detail: str = "") -> None:
+        self.current = max(0, min(int(current), self.total if self.total else int(current)))
+        if not self.enabled:
+            return
+        elapsed = time.perf_counter() - self.start_time
+        eta = _estimate_eta(elapsed, self.current, self.total)
+        filled = self.width if self.total == 0 else int(self.width * self.current / max(1, self.total))
+        bar = "█" * filled + "-" * (self.width - filled)
+        lines = [
+            self.label,
+            f"{bar} {self.current}/{self.total}",
+        ]
+        if detail:
+            lines.append(detail)
+        lines.append(f"Elapsed: {_format_duration(elapsed)}")
+        if eta is not None:
+            lines.append(f"ETA: {_format_duration(eta)}")
+        print("\n".join(lines), flush=True)
+
+    def finish(self, detail: str = "") -> None:
+        self.update(self.total, detail=detail)
 
 
 def coordinate_to_filename(
@@ -804,6 +869,8 @@ def save_tiles(
     resume: bool = False,
     filename_prefix: str = "tile",
     include_component_id: bool = False,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    progress_label: str = "tiles",
 ) -> list[Path]:
     """Crop and save accepted native-resolution level-0 tiles."""
 
@@ -812,7 +879,8 @@ def save_tiles(
     ext = _image_extension(image_format)
     saved_paths: list[Path] = []
 
-    for tile in tiles:
+    total = len(tiles)
+    for index, tile in enumerate(tiles, start=1):
         filename = coordinate_to_filename(
             tile.x,
             tile.y,
@@ -827,6 +895,8 @@ def save_tiles(
         if path.exists() and resume:
             tile.skipped_existing = True
             saved_paths.append(path)
+            if progress_callback:
+                progress_callback(index, total, progress_label)
             continue
         if path.exists() and not overwrite:
             raise TileGenerationError(f"Refusing to overwrite existing tile: {path}")
@@ -842,6 +912,8 @@ def save_tiles(
             save_kwargs["subsampling"] = 0
         image.save(path, **save_kwargs)
         saved_paths.append(path)
+        if progress_callback:
+            progress_callback(index, total, progress_label)
 
     skipped = sum(1 for tile in tiles if tile.skipped_existing)
     LOGGER.info(
@@ -957,6 +1029,17 @@ def visualize_tiles(
     return output_path
 
 
+def save_tissue_mask_image(mask: np.ndarray, output_path: str | Path) -> Path:
+    """Save a binary tissue mask diagnostic image."""
+
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.fromarray((np.asarray(mask, dtype=bool).astype(np.uint8) * 255), mode="L")
+    image.save(path)
+    LOGGER.info("Saved tissue mask visualization to %s.", path)
+    return path
+
+
 def export_tile_metadata(tiles: Sequence[TileRecord], csv_path: str | Path) -> Path:
     """Write accepted tile metadata to CSV."""
 
@@ -1008,6 +1091,69 @@ def export_tile_metadata(tiles: Sequence[TileRecord], csv_path: str | Path) -> P
     return path
 
 
+def export_tile_coordinates(tiles: Sequence[TileRecord], csv_path: str | Path) -> Path:
+    """Write a compact coordinate lookup CSV for downstream WSI overlays."""
+
+    path = Path(csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "tile_id",
+                "tile_filename",
+                "component_id",
+                "level0_x",
+                "level0_y",
+                "tile_width",
+                "tile_height",
+                "tile_status",
+            ],
+        )
+        writer.writeheader()
+        for tile in tiles:
+            writer.writerow(
+                {
+                    "tile_id": tile.tile_id,
+                    "tile_filename": tile.path.name if tile.path else coordinate_to_filename(tile.x, tile.y),
+                    "component_id": tile.component_id,
+                    "level0_x": tile.x,
+                    "level0_y": tile.y,
+                    "tile_width": tile.width,
+                    "tile_height": tile.height,
+                    "tile_status": "accepted" if tile.accepted else "rejected",
+                }
+            )
+    LOGGER.info("Exported coordinate lookup for %s tiles to %s.", len(tiles), path)
+    return path
+
+
+def export_tile_summary(statistics: Mapping[str, Any], csv_path: str | Path) -> Path:
+    """Write a one-row per-slide summary CSV."""
+
+    path = Path(csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "slide_name",
+        "ROI_width",
+        "ROI_height",
+        "num_components",
+        "candidate_tiles",
+        "accepted_tiles",
+        "rejected_tiles",
+        "tissue_area",
+        "average_tissue_percent",
+        "average_white_percent",
+        "processing_time_seconds",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow({key: statistics.get(key, "") for key in fieldnames})
+    LOGGER.info("Exported tile summary to %s.", path)
+    return path
+
+
 def export_tile_statistics(statistics: Mapping[str, Any], json_path: str | Path) -> Path:
     """Write run-level tile-generation statistics to JSON."""
 
@@ -1026,6 +1172,7 @@ def generate_tiles(
     slide: Any | None = None,
     return_images: bool = True,
     save_to_disk: bool = True,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, Any]:
     """Generate WSI tiles through the standalone public API.
 
@@ -1114,6 +1261,15 @@ def generate_tiles(
         save_rejected_tiles = bool(saving_cfg.get("save_rejected_tiles", True))
         saved_tiles: list[Path] = []
         saved_rejected_tiles: list[Path] = []
+        progress_total = len(accepted) + (len(rejected) if save_rejected_tiles else 0)
+        progress_offsets = {"accepted tiles": 0, "rejected tiles": len(accepted)}
+
+        def _combined_progress(current: int, total: int, label: str) -> None:
+            if progress_callback is None:
+                return
+            offset = progress_offsets.get(label, 0)
+            progress_callback(offset + current, progress_total, "tile generation")
+
         if save_to_disk:
             saved_tiles = save_tiles(
                 slide_obj,
@@ -1125,6 +1281,8 @@ def generate_tiles(
                 resume=bool(saving_cfg.get("resume", True)),
                 filename_prefix=filename_prefix,
                 include_component_id=include_component_id,
+                progress_callback=_combined_progress,
+                progress_label="accepted tiles",
             )
             if save_rejected_tiles:
                 saved_rejected_tiles = save_tiles(
@@ -1137,6 +1295,8 @@ def generate_tiles(
                     resume=bool(saving_cfg.get("resume", True)),
                     filename_prefix=filename_prefix,
                     include_component_id=include_component_id,
+                    progress_callback=_combined_progress,
+                    progress_label="rejected tiles",
                 )
             else:
                 _assign_tile_paths(
@@ -1167,6 +1327,10 @@ def generate_tiles(
             accepted + rejected,
             output_dir / metadata_cfg.get("filename", "tile_metadata.csv"),
         )
+        coordinates_path = export_tile_coordinates(
+            accepted + rejected,
+            output_dir / metadata_cfg.get("coordinates_filename", "tile_coordinates.csv"),
+        )
 
         visualization_cfg = cfg.get("visualization", {})
         visualization_path = visualize_tiles(
@@ -1185,6 +1349,10 @@ def generate_tiles(
             draw_component_labels=bool(visualization_cfg.get("draw_component_labels", True)),
             max_tile_labels=visualization_cfg.get("max_tile_labels", 300),
         )
+        tissue_mask_path = save_tissue_mask_image(
+            cleaned_mask,
+            output_dir / visualization_cfg.get("tissue_mask_filename", "tissue_mask.png"),
+        )
 
         processing_time = time.perf_counter() - start_time
         statistics_cfg = cfg.get("statistics", {})
@@ -1200,6 +1368,10 @@ def generate_tiles(
         statistics_path = export_tile_statistics(
             statistics,
             output_dir / statistics_cfg.get("filename", "tile_statistics.json"),
+        )
+        summary_path = export_tile_summary(
+            statistics,
+            output_dir / metadata_cfg.get("summary_filename", "tile_summary.csv"),
         )
 
         generated_tiles = _build_generated_tiles(slide_obj, accepted, return_images=return_images)
@@ -1224,9 +1396,12 @@ def generate_tiles(
             "saved_tile_paths": saved_tiles,
             "saved_rejected_tile_paths": saved_rejected_tiles,
             "metadata_path": metadata_path,
+            "coordinates_path": coordinates_path,
             "visualization_path": visualization_path,
+            "tissue_mask_path": tissue_mask_path,
             "statistics": statistics,
             "statistics_path": statistics_path,
+            "summary_path": summary_path,
         }
     finally:
         if close_slide and hasattr(slide_obj, "close"):
@@ -1249,6 +1424,382 @@ def run_tile_generation(
     )
 
 
+def process_wsi_batch(
+    input_dir: str | Path,
+    output_dir: str | Path,
+    config_path: str | Path | None = None,
+    config: Mapping[str, Any] | None = None,
+    force: bool = False,
+    return_images: bool = False,
+    slide_factory: Callable[[Path], Any] | None = None,
+    show_progress: bool = True,
+) -> list[BatchSlideResult]:
+    """Process every supported WSI in ``input_dir`` into per-slide output folders."""
+
+    base_config = load_config(config_path)
+    if config:
+        base_config = _deep_merge(base_config, dict(config))
+
+    input_path = Path(input_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    wsi_files = discover_wsi_files(input_path)
+    if not wsi_files:
+        raise TileGenerationError(f"No supported .tif/.tiff WSI files found in {input_path}")
+
+    batch_cfg = base_config.get("batch", {})
+    marker_name = str(batch_cfg.get("completed_marker", "_COMPLETED.json"))
+    effective_force = bool(force or batch_cfg.get("force", False))
+    results: list[BatchSlideResult] = []
+    overall = ProgressPrinter("Processing WSIs", len(wsi_files), enabled=show_progress)
+    batch_start = time.perf_counter()
+
+    for index, slide_path in enumerate(wsi_files, start=1):
+        slide_start = time.perf_counter()
+        slide_name = slide_path.stem
+        slide_output_dir = output_path / slide_name
+        marker_path = slide_output_dir / marker_name
+        overall.update(
+            index - 1,
+            detail=f"Current:\n{slide_path.name}",
+        )
+
+        if _is_slide_completed(slide_output_dir, marker_name) and not effective_force:
+            marker_data = _read_completion_marker(marker_path)
+            result = _result_from_marker(slide_path, slide_output_dir, marker_data)
+            result.status = "Skipped"
+            results.append(result)
+            print(f"Skipped (already processed): {slide_path.name}", flush=True)
+            overall.update(
+                index,
+                detail=(
+                    f"Current:\n{slide_path.name}\n\n"
+                    f"Accepted: {result.accepted_tiles}\n"
+                    f"Rejected: {result.rejected_tiles}\n"
+                    f"Elapsed: {_format_duration(time.perf_counter() - batch_start)}"
+                ),
+            )
+            continue
+
+        if effective_force and slide_output_dir.exists():
+            shutil.rmtree(slide_output_dir)
+
+        _create_slide_output_layout(slide_output_dir)
+        slide_config = _build_batch_slide_config(base_config, slide_path, slide_output_dir)
+        _write_config_snapshot(slide_config, slide_output_dir / "logs" / "configuration_snapshot.yaml")
+        tile_progress_holder: dict[str, ProgressPrinter] = {}
+
+        def _tile_progress(current: int, total: int, label: str) -> None:
+            progress = tile_progress_holder.get("progress")
+            if progress is None or progress.total != total:
+                progress = ProgressPrinter("Tile generation", total, enabled=show_progress)
+                tile_progress_holder["progress"] = progress
+            progress.update(
+                current,
+                detail=(
+                    f"Current:\n{slide_path.name}\n\n"
+                    f"Stage: {label}"
+                ),
+            )
+
+        try:
+            with _slide_file_logging(slide_output_dir / "logs" / "processing.log"):
+                LOGGER.info("Starting WSI batch item: %s", slide_path)
+                slide_obj = slide_factory(slide_path) if slide_factory else None
+                try:
+                    tile_results = generate_tiles(
+                        config=slide_config,
+                        slide=slide_obj,
+                        return_images=return_images,
+                        save_to_disk=True,
+                        progress_callback=_tile_progress,
+                    )
+                finally:
+                    if slide_obj is not None and hasattr(slide_obj, "close"):
+                        slide_obj.close()
+
+                statistics = dict(tile_results["statistics"])
+                elapsed = time.perf_counter() - slide_start
+                timestamp = _timestamp()
+                result = BatchSlideResult(
+                    wsi_filename=slide_path.name,
+                    slide_name=slide_name,
+                    output_dir=slide_output_dir,
+                    accepted_tiles=int(statistics.get("accepted_tiles", 0)),
+                    rejected_tiles=int(statistics.get("rejected_tiles", 0)),
+                    total_tiles=int(statistics.get("candidate_tiles", 0)),
+                    tissue_area=int(statistics.get("tissue_area", 0)),
+                    processing_time_seconds=elapsed,
+                    completion_timestamp=timestamp,
+                    status="Completed",
+                )
+                _write_completion_marker(marker_path, result, statistics)
+                results.append(result)
+                LOGGER.info("Completed WSI batch item: %s", slide_path)
+                _print_slide_summary(result)
+        except Exception as exc:  # noqa: BLE001 - batch processing should continue
+            elapsed = time.perf_counter() - slide_start
+            result = BatchSlideResult(
+                wsi_filename=slide_path.name,
+                slide_name=slide_name,
+                output_dir=slide_output_dir,
+                processing_time_seconds=elapsed,
+                completion_timestamp=_timestamp(),
+                status="Failed",
+                error=str(exc),
+            )
+            results.append(result)
+            _write_failure_log(slide_output_dir / "logs" / "processing.log", exc)
+            print(f"Failed: {slide_path.name}: {exc}", flush=True)
+
+        latest = results[-1]
+        overall.update(
+            index,
+            detail=(
+                f"Current:\n{slide_path.name}\n\n"
+                f"Accepted: {latest.accepted_tiles}\n"
+                f"Rejected: {latest.rejected_tiles}\n"
+                f"Elapsed: {_format_duration(time.perf_counter() - batch_start)}"
+            ),
+        )
+
+    batch_summary_path = output_path / str(batch_cfg.get("batch_summary_filename", "batch_summary.csv"))
+    export_batch_summary(results, batch_summary_path)
+    overall.finish(detail=f"Batch summary:\n{batch_summary_path}")
+    return results
+
+
+def discover_wsi_files(input_dir: str | Path) -> list[Path]:
+    """Return supported WSI files sorted alphabetically by filename."""
+
+    path = Path(input_dir)
+    if not path.exists():
+        raise TileGenerationError(f"Input directory does not exist: {path}")
+    if not path.is_dir():
+        raise TileGenerationError(f"Input path is not a directory: {path}")
+    return sorted(
+        [
+            item
+            for item in path.iterdir()
+            if (
+                item.is_file()
+                and item.suffix.lower() in SUPPORTED_WSI_EXTENSIONS
+                and not item.name.startswith(".")
+                and not item.name.startswith("._")
+            )
+        ],
+        key=lambda item: item.name.lower(),
+    )
+
+
+def export_batch_summary(results: Sequence[BatchSlideResult], csv_path: str | Path) -> Path:
+    """Write one batch summary row per WSI."""
+
+    path = Path(csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "WSI filename",
+        "accepted tiles",
+        "rejected tiles",
+        "total tiles",
+        "tissue area",
+        "processing time",
+        "processing time seconds",
+        "completion timestamp",
+        "status",
+        "output folder",
+        "error",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in results:
+            writer.writerow(
+                {
+                    "WSI filename": result.wsi_filename,
+                    "accepted tiles": result.accepted_tiles,
+                    "rejected tiles": result.rejected_tiles,
+                    "total tiles": result.total_tiles,
+                    "tissue area": result.tissue_area,
+                    "processing time": _format_duration(result.processing_time_seconds),
+                    "processing time seconds": f"{result.processing_time_seconds:.4f}",
+                    "completion timestamp": result.completion_timestamp,
+                    "status": result.status,
+                    "output folder": str(result.output_dir),
+                    "error": result.error,
+                }
+            )
+    LOGGER.info("Exported batch summary to %s.", path)
+    return path
+
+
+def _build_batch_slide_config(
+    base_config: Mapping[str, Any],
+    slide_path: Path,
+    slide_output_dir: Path,
+) -> dict[str, Any]:
+    cfg = _deep_copy(dict(base_config))
+    overrides = {
+        "slide_path": str(slide_path),
+        "output_dir": str(slide_output_dir),
+        "saving": {
+            "accepted_tiles_subdir": "tiles/accepted_tiles",
+            "rejected_tiles_subdir": "tiles/rejected_tiles",
+        },
+        "metadata": {
+            "filename": "metadata/tile_metadata.csv",
+            "coordinates_filename": "metadata/tile_coordinates.csv",
+            "summary_filename": "metadata/tile_summary.csv",
+        },
+        "visualization": {
+            "filename": "visualization/patient_tile_map.png",
+            "tissue_mask_filename": "visualization/tissue_mask.png",
+        },
+        "statistics": {
+            "filename": "metadata/tile_statistics.json",
+        },
+    }
+    return _deep_merge(cfg, overrides)
+
+
+def _create_slide_output_layout(slide_output_dir: Path) -> None:
+    for subdir in [
+        slide_output_dir / "tiles" / "accepted_tiles",
+        slide_output_dir / "tiles" / "rejected_tiles",
+        slide_output_dir / "metadata",
+        slide_output_dir / "visualization",
+        slide_output_dir / "logs",
+    ]:
+        subdir.mkdir(parents=True, exist_ok=True)
+
+
+def _is_slide_completed(slide_output_dir: Path, marker_name: str) -> bool:
+    marker = slide_output_dir / marker_name
+    metadata = slide_output_dir / "metadata" / "tile_metadata.csv"
+    coordinates = slide_output_dir / "metadata" / "tile_coordinates.csv"
+    return marker.exists() or (metadata.exists() and coordinates.exists())
+
+
+def _read_completion_marker(marker_path: Path) -> dict[str, Any]:
+    if not marker_path.exists():
+        return {}
+    try:
+        with marker_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _result_from_marker(
+    slide_path: Path,
+    slide_output_dir: Path,
+    marker_data: Mapping[str, Any],
+) -> BatchSlideResult:
+    statistics = marker_data.get("statistics", {})
+    if not isinstance(statistics, Mapping):
+        statistics = {}
+    if not statistics:
+        statistics = _read_slide_summary_statistics(slide_output_dir / "metadata" / "tile_summary.csv")
+    return BatchSlideResult(
+        wsi_filename=slide_path.name,
+        slide_name=slide_path.stem,
+        output_dir=slide_output_dir,
+        accepted_tiles=int(statistics.get("accepted_tiles", marker_data.get("accepted_tiles", 0)) or 0),
+        rejected_tiles=int(statistics.get("rejected_tiles", marker_data.get("rejected_tiles", 0)) or 0),
+        total_tiles=int(statistics.get("candidate_tiles", marker_data.get("total_tiles", 0)) or 0),
+        tissue_area=int(statistics.get("tissue_area", marker_data.get("tissue_area", 0)) or 0),
+        processing_time_seconds=float(marker_data.get("processing_time_seconds", 0.0) or 0.0),
+        completion_timestamp=str(marker_data.get("completion_timestamp", "")),
+        status=str(marker_data.get("status", "Completed")),
+    )
+
+
+def _read_slide_summary_statistics(summary_path: Path) -> dict[str, Any]:
+    if not summary_path.exists():
+        return {}
+    try:
+        with summary_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    except OSError:
+        return {}
+    if not rows:
+        return {}
+    row = rows[0]
+    return {
+        "accepted_tiles": row.get("accepted_tiles", 0),
+        "rejected_tiles": row.get("rejected_tiles", 0),
+        "candidate_tiles": row.get("candidate_tiles", 0),
+        "tissue_area": row.get("tissue_area", 0),
+    }
+
+
+def _write_completion_marker(
+    marker_path: Path,
+    result: BatchSlideResult,
+    statistics: Mapping[str, Any],
+) -> None:
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "wsi_filename": result.wsi_filename,
+        "slide_name": result.slide_name,
+        "accepted_tiles": result.accepted_tiles,
+        "rejected_tiles": result.rejected_tiles,
+        "total_tiles": result.total_tiles,
+        "tissue_area": result.tissue_area,
+        "processing_time_seconds": result.processing_time_seconds,
+        "completion_timestamp": result.completion_timestamp,
+        "status": result.status,
+        "statistics": dict(statistics),
+    }
+    with marker_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+
+def _write_config_snapshot(config: Mapping[str, Any], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    serializable = _json_safe(config)
+    if yaml is not None:
+        with output_path.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(serializable, handle, sort_keys=False)
+    else:
+        json_path = output_path.with_suffix(".json")
+        with json_path.open("w", encoding="utf-8") as handle:
+            json.dump(serializable, handle, indent=2)
+            handle.write("\n")
+
+
+@contextlib.contextmanager
+def _slide_file_logging(log_path: Path) -> Any:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        root_logger.removeHandler(handler)
+        handler.close()
+
+
+def _write_failure_log(log_path: Path, exc: Exception) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{_timestamp()} ERROR Failed: {exc}\n")
+
+
+def _print_slide_summary(result: BatchSlideResult) -> None:
+    print("-" * 52, flush=True)
+    print(f"Finished:\n{result.slide_name}", flush=True)
+    print(f"Accepted tiles : {result.accepted_tiles}", flush=True)
+    print(f"Rejected tiles : {result.rejected_tiles}", flush=True)
+    print(f"Total tiles    : {result.total_tiles}", flush=True)
+    print(f"Elapsed time   : {_format_duration(result.processing_time_seconds)}", flush=True)
+    print("-" * 52, flush=True)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Command-line entry point."""
 
@@ -1260,7 +1811,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--slide", help="Override slide_path from the config.")
     parser.add_argument("--output-dir", help="Override output_dir from the config.")
+    parser.add_argument("--input-dir", help="Batch input directory containing .tif/.tiff WSIs.")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing completed WSI outputs.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable terminal progress bars.")
     args = parser.parse_args(argv)
+
+    cfg_for_mode = load_config(args.config)
+    batch_input_dir = args.input_dir or cfg_for_mode.get("batch", {}).get("input_dir")
+    if batch_input_dir:
+        batch_output_dir = (
+            args.output_dir
+            or cfg_for_mode.get("batch", {}).get("output_dir")
+            or cfg_for_mode.get("output_dir", "output")
+        )
+        process_wsi_batch(
+            input_dir=batch_input_dir,
+            output_dir=batch_output_dir,
+            config_path=args.config,
+            force=args.force,
+            return_images=False,
+            show_progress=not args.no_progress,
+        )
+        return 0
 
     overrides: dict[str, Any] = {}
     if args.slide:
@@ -1318,6 +1890,38 @@ def _safe_filename_token(value: str) -> str:
 
 def _coordinate_tile_id(x: int, y: int) -> str:
     return f"x{int(x)}_y{int(y)}"
+
+
+def _timestamp() -> str:
+    return dt.datetime.now().isoformat(timespec="seconds")
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def _estimate_eta(elapsed: float, current: int, total: int) -> float | None:
+    if current <= 0 or total <= 0 or current >= total:
+        return None
+    rate = elapsed / current
+    return rate * (total - current)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _slide_dimensions(slide: Any) -> tuple[int, int]:
@@ -1761,6 +2365,7 @@ def _build_statistics(
 ) -> dict[str, Any]:
     tissue_values = [tile.tissue_percentage for tile in accepted]
     white_values = [tile.white_percentage for tile in accepted]
+    tissue_area = int(sum(component.area_pixels for component in components))
     return {
         "slide_name": slide_name,
         "ROI_width": roi.width if roi else 0,
@@ -1769,6 +2374,7 @@ def _build_statistics(
         "candidate_tiles": len(candidates),
         "accepted_tiles": len(accepted),
         "rejected_tiles": len(rejected),
+        "tissue_area": tissue_area,
         "average_tissue_percent": float(np.mean(tissue_values)) if tissue_values else 0.0,
         "average_white_percent": float(np.mean(white_values)) if white_values else 0.0,
         "processing_time_seconds": float(processing_time_seconds),

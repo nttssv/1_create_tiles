@@ -85,9 +85,12 @@ saving:
 
 metadata:
   filename: tile_metadata.csv
+  coordinates_filename: tile_coordinates.csv
+  summary_filename: tile_summary.csv
 
 visualization:
   filename: patient_tile_map.png
+  tissue_mask_filename: tissue_mask.png
   dpi: 160
   # Set a positive integer to cap drawn rectangles on extremely large slides.
   max_tiles_to_draw: null
@@ -97,6 +100,14 @@ visualization:
 
 statistics:
   filename: tile_statistics.json
+
+batch:
+  # Set input_dir here or pass --input-dir on the command line.
+  input_dir: null
+  output_dir: output
+  completed_marker: _COMPLETED.json
+  batch_summary_filename: batch_summary.csv
+  force: false
 
 logging:
   level: INFO
