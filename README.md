@@ -97,7 +97,18 @@ python examples/rename_unreadable_wsi.py \
 ```
 
 The first command is a dry run. The second renames files unreadable by both
-OpenSlide and tiffslide, for example `MTO107_CORRUPT.tiff`.
+OpenSlide and tiffslide, for example `MTO107_CORRUPT.tiff.corrupt`, so batch
+mode will skip them automatically.
+If a file can be opened but still crashes during batch tiling, rename every
+remaining `Failed` row from `batch_summary.csv`:
+
+```bash
+python examples/rename_unreadable_wsi.py \
+  --input-dir raw_images \
+  --batch-summary output/batch_summary.csv \
+  --rename-all-batch-failed \
+  --apply
+```
 
 ## Direct API
 

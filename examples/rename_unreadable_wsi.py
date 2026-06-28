@@ -46,9 +46,19 @@ def main() -> int:
     )
     parser.add_argument("--suffix", default="_CORRUPT", help="Suffix inserted before the file extension.")
     parser.add_argument(
+        "--keep-extension",
+        action="store_true",
+        help="Keep the .tif/.tiff extension. By default renamed files end with .corrupt so batch mode skips them.",
+    )
+    parser.add_argument(
         "--report",
         default="rename_unreadable_wsi_report.csv",
         help="CSV report path. Relative paths are written under input-dir.",
+    )
+    parser.add_argument(
+        "--rename-all-batch-failed",
+        action="store_true",
+        help="With --batch-summary, rename every row whose status is Failed even if a reader opens it.",
     )
     parser.add_argument("--apply", action="store_true", help="Actually rename unreadable files.")
     args = parser.parse_args()
@@ -64,8 +74,9 @@ def main() -> int:
     results: list[CheckResult] = []
     for path in candidates:
         result = check_slide(path)
-        if not result.readable:
-            result.new_path = unique_renamed_path(path, args.suffix)
+        should_rename = not result.readable or bool(args.rename_all_batch_failed and args.batch_summary)
+        if should_rename:
+            result.new_path = unique_renamed_path(path, args.suffix, keep_extension=args.keep_extension)
             if args.apply:
                 path.rename(result.new_path)
                 result.renamed = True
@@ -113,9 +124,12 @@ def check_slide(path: Path) -> CheckResult:
     if openslide is not None:
         try:
             slide = openslide.OpenSlide(str(path))
+            validate_opened_slide(slide)
             slide.close()
             return CheckResult(path=path, readable=True, backend="openslide", error="")
         except Exception as exc:  # noqa: BLE001 - diagnostic utility
+            if "slide" in locals() and hasattr(slide, "close"):
+                slide.close()
             errors.append(f"openslide: {exc!r}")
     else:
         errors.append("openslide: not installed")
@@ -123,9 +137,12 @@ def check_slide(path: Path) -> CheckResult:
     if tiffslide is not None:
         try:
             slide = tiffslide.TiffSlide(str(path))
+            validate_opened_slide(slide)
             slide.close()
             return CheckResult(path=path, readable=True, backend="tiffslide", error="")
         except Exception as exc:  # noqa: BLE001 - diagnostic utility
+            if "slide" in locals() and hasattr(slide, "close"):
+                slide.close()
             errors.append(f"tiffslide: {exc!r}")
     else:
         errors.append("tiffslide: not installed")
@@ -133,15 +150,27 @@ def check_slide(path: Path) -> CheckResult:
     return CheckResult(path=path, readable=False, backend="", error="; ".join(errors))
 
 
-def unique_renamed_path(path: Path, suffix: str) -> Path:
+def validate_opened_slide(slide: object) -> None:
+    width, height = getattr(slide, "dimensions")
+    thumb_size = (min(64, max(1, int(width))), min(64, max(1, int(height))))
+    slide.get_thumbnail(thumb_size)
+
+
+def unique_renamed_path(path: Path, suffix: str, keep_extension: bool = False) -> Path:
     suffix = suffix.strip() or "_CORRUPT"
-    if path.stem.endswith(suffix):
+    if path.stem.endswith(suffix) and (keep_extension or path.suffix == ".corrupt"):
         return path
 
-    candidate = path.with_name(f"{path.stem}{suffix}{path.suffix}")
+    if keep_extension:
+        candidate = path.with_name(f"{path.stem}{suffix}{path.suffix}")
+    else:
+        candidate = path.with_name(f"{path.stem}{suffix}{path.suffix}.corrupt")
     counter = 2
     while candidate.exists():
-        candidate = path.with_name(f"{path.stem}{suffix}_{counter}{path.suffix}")
+        if keep_extension:
+            candidate = path.with_name(f"{path.stem}{suffix}_{counter}{path.suffix}")
+        else:
+            candidate = path.with_name(f"{path.stem}{suffix}_{counter}{path.suffix}.corrupt")
         counter += 1
     return candidate
 

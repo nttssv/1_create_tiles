@@ -2657,9 +2657,12 @@ def _open_slide(slide_path: str | Path, backend: str = "auto") -> tuple[Any, boo
         else:
             try:
                 slide = openslide.OpenSlide(str(path))
+                _validate_opened_slide(slide)
                 LOGGER.info("Opened slide with OpenSlide backend: %s", path)
                 return slide, True
             except Exception as exc:  # noqa: BLE001 - fallback to tiffslide if configured
+                if "slide" in locals() and hasattr(slide, "close"):
+                    slide.close()
                 errors.append(f"OpenSlide failed: {exc!r}")
                 if selected_backend == "openslide":
                     raise TileGenerationError("; ".join(errors)) from exc
@@ -2670,14 +2673,23 @@ def _open_slide(slide_path: str | Path, backend: str = "auto") -> tuple[Any, boo
         else:
             try:
                 slide = tiffslide.TiffSlide(str(path))
+                _validate_opened_slide(slide)
                 LOGGER.info("Opened slide with tiffslide backend: %s", path)
                 return slide, True
             except Exception as exc:  # noqa: BLE001 - report both backend errors
+                if "slide" in locals() and hasattr(slide, "close"):
+                    slide.close()
                 errors.append(f"tiffslide failed: {exc!r}")
                 if selected_backend == "tiffslide":
                     raise TileGenerationError("; ".join(errors)) from exc
 
     raise TileGenerationError(f"Unable to open slide {path}. " + "; ".join(errors))
+
+
+def _validate_opened_slide(slide: Any) -> None:
+    width, height = _slide_dimensions(slide)
+    thumb_size = (min(64, max(1, width)), min(64, max(1, height)))
+    slide.get_thumbnail(thumb_size)
 
 
 def _deep_copy(value: Any) -> Any:
