@@ -36,7 +36,8 @@ Batch mode:
 python -m tile_generator \
   --config tile_generator_config.yaml \
   --input-dir raw_images \
-  --output-dir output
+  --output-dir output \
+  --workers 4
 ```
 
 Each WSI gets its own folder:
@@ -51,6 +52,8 @@ output/26RR000079-A-01-01/
 
 Use `--force` to overwrite a completed WSI output. Otherwise, completed slides
 are skipped automatically and `output/batch_summary.csv` is updated.
+Parallel workers run at the WSI level; each worker opens its own slide and
+writes to a dedicated output folder.
 
 ## Direct API
 

@@ -283,7 +283,8 @@ Process an entire folder of `.tif` and `.tiff` WSIs in alphabetical order:
 python -m tile_generator \
   --config tile_generator_config.yaml \
   --input-dir raw_images \
-  --output-dir output
+  --output-dir output \
+  --workers 4
 ```
 
 For each WSI, the batch runner creates:
@@ -323,7 +324,13 @@ tiles, total tiles, tissue area, processing time, completion timestamp, status,
 output folder, and any error message.
 
 Batch mode prints an overall WSI progress bar and a per-WSI tile-generation
-progress bar while accepted/rejected tile files are written.
+progress bar while accepted/rejected tile files are written. With
+`--workers > 1`, progress is reported at the WSI-completion level to avoid
+multiple processes writing overlapping terminal bars; each slide still writes
+its own `logs/processing.log`.
+
+Parallelization is across WSIs, not within a single WSI. Each worker opens its
+own OpenSlide handle and writes to a dedicated slide output folder.
 
 ## Multiprocessing Notes
 

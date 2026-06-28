@@ -108,6 +108,8 @@ batch:
   completed_marker: _COMPLETED.json
   batch_summary_filename: batch_summary.csv
   force: false
+  # Parallelize across WSIs. Each worker opens its own slide.
+  workers: 1
 
 logging:
   level: INFO

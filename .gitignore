@@ -6,3 +6,5 @@ __pycache__/
 tile_output/
 tmp_*_smoke/
 tmp_batch_*/
+tmp_worker*/
+tmp_cli_worker*/

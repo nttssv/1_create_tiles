@@ -9,6 +9,7 @@ size; thumbnail images are used only for tissue detection and tile filtering.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import csv
 import datetime as dt
@@ -132,6 +133,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "completed_marker": "_COMPLETED.json",
         "batch_summary_filename": "batch_summary.csv",
         "force": False,
+        "workers": 1,
     },
     "logging": {
         "level": "INFO",
@@ -1433,6 +1435,7 @@ def process_wsi_batch(
     return_images: bool = False,
     slide_factory: Callable[[Path], Any] | None = None,
     show_progress: bool = True,
+    workers: int | None = None,
 ) -> list[BatchSlideResult]:
     """Process every supported WSI in ``input_dir`` into per-slide output folders."""
 
@@ -1450,123 +1453,220 @@ def process_wsi_batch(
     batch_cfg = base_config.get("batch", {})
     marker_name = str(batch_cfg.get("completed_marker", "_COMPLETED.json"))
     effective_force = bool(force or batch_cfg.get("force", False))
+    worker_count = max(1, int(workers or batch_cfg.get("workers", 1) or 1))
+    if slide_factory is not None and worker_count > 1:
+        LOGGER.warning("slide_factory was provided; falling back to one worker for safe testing.")
+        worker_count = 1
     results: list[BatchSlideResult] = []
     overall = ProgressPrinter("Processing WSIs", len(wsi_files), enabled=show_progress)
     batch_start = time.perf_counter()
 
-    for index, slide_path in enumerate(wsi_files, start=1):
-        slide_start = time.perf_counter()
-        slide_name = slide_path.stem
-        slide_output_dir = output_path / slide_name
-        marker_path = slide_output_dir / marker_name
-        overall.update(
-            index - 1,
-            detail=f"Current:\n{slide_path.name}",
-        )
-
-        if _is_slide_completed(slide_output_dir, marker_name) and not effective_force:
-            marker_data = _read_completion_marker(marker_path)
-            result = _result_from_marker(slide_path, slide_output_dir, marker_data)
-            result.status = "Skipped"
+    if worker_count == 1:
+        for index, slide_path in enumerate(wsi_files, start=1):
+            overall.update(index - 1, detail=f"Current:\n{slide_path.name}")
+            result = _process_batch_slide_item(
+                index=index,
+                slide_path=slide_path,
+                output_path=output_path,
+                base_config=base_config,
+                marker_name=marker_name,
+                force=effective_force,
+                return_images=return_images,
+                slide_factory=slide_factory,
+                show_tile_progress=show_progress,
+                print_summary=False,
+            )
             results.append(result)
-            print(f"Skipped (already processed): {slide_path.name}", flush=True)
+            _report_batch_result(result)
             overall.update(
                 index,
-                detail=(
-                    f"Current:\n{slide_path.name}\n\n"
-                    f"Accepted: {result.accepted_tiles}\n"
-                    f"Rejected: {result.rejected_tiles}\n"
-                    f"Elapsed: {_format_duration(time.perf_counter() - batch_start)}"
-                ),
+                detail=_overall_progress_detail(result, batch_start),
             )
-            continue
-
-        if effective_force and slide_output_dir.exists():
-            shutil.rmtree(slide_output_dir)
-
-        _create_slide_output_layout(slide_output_dir)
-        slide_config = _build_batch_slide_config(base_config, slide_path, slide_output_dir)
-        _write_config_snapshot(slide_config, slide_output_dir / "logs" / "configuration_snapshot.yaml")
-        tile_progress_holder: dict[str, ProgressPrinter] = {}
-
-        def _tile_progress(current: int, total: int, label: str) -> None:
-            progress = tile_progress_holder.get("progress")
-            if progress is None or progress.total != total:
-                progress = ProgressPrinter("Tile generation", total, enabled=show_progress)
-                tile_progress_holder["progress"] = progress
-            progress.update(
-                current,
-                detail=(
-                    f"Current:\n{slide_path.name}\n\n"
-                    f"Stage: {label}"
-                ),
-            )
-
-        try:
-            with _slide_file_logging(slide_output_dir / "logs" / "processing.log"):
-                LOGGER.info("Starting WSI batch item: %s", slide_path)
-                slide_obj = slide_factory(slide_path) if slide_factory else None
-                try:
-                    tile_results = generate_tiles(
-                        config=slide_config,
-                        slide=slide_obj,
-                        return_images=return_images,
-                        save_to_disk=True,
-                        progress_callback=_tile_progress,
-                    )
-                finally:
-                    if slide_obj is not None and hasattr(slide_obj, "close"):
-                        slide_obj.close()
-
-                statistics = dict(tile_results["statistics"])
-                elapsed = time.perf_counter() - slide_start
-                timestamp = _timestamp()
-                result = BatchSlideResult(
-                    wsi_filename=slide_path.name,
-                    slide_name=slide_name,
-                    output_dir=slide_output_dir,
-                    accepted_tiles=int(statistics.get("accepted_tiles", 0)),
-                    rejected_tiles=int(statistics.get("rejected_tiles", 0)),
-                    total_tiles=int(statistics.get("candidate_tiles", 0)),
-                    tissue_area=int(statistics.get("tissue_area", 0)),
-                    processing_time_seconds=elapsed,
-                    completion_timestamp=timestamp,
-                    status="Completed",
+    else:
+        print(f"Processing {len(wsi_files)} WSIs with {worker_count} workers.", flush=True)
+        ordered_results: dict[int, BatchSlideResult] = {}
+        futures: dict[concurrent.futures.Future[tuple[int, BatchSlideResult]], tuple[int, Path]] = {}
+        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+            for index, slide_path in enumerate(wsi_files, start=1):
+                future = executor.submit(
+                    _process_batch_slide_item_worker,
+                    index,
+                    str(slide_path),
+                    str(output_path),
+                    _json_safe(base_config),
+                    marker_name,
+                    effective_force,
+                    return_images,
                 )
-                _write_completion_marker(marker_path, result, statistics)
-                results.append(result)
-                LOGGER.info("Completed WSI batch item: %s", slide_path)
-                _print_slide_summary(result)
-        except Exception as exc:  # noqa: BLE001 - batch processing should continue
-            elapsed = time.perf_counter() - slide_start
-            result = BatchSlideResult(
-                wsi_filename=slide_path.name,
-                slide_name=slide_name,
-                output_dir=slide_output_dir,
-                processing_time_seconds=elapsed,
-                completion_timestamp=_timestamp(),
-                status="Failed",
-                error=str(exc),
-            )
-            results.append(result)
-            _write_failure_log(slide_output_dir / "logs" / "processing.log", exc)
-            print(f"Failed: {slide_path.name}: {exc}", flush=True)
+                futures[future] = (index, slide_path)
 
-        latest = results[-1]
-        overall.update(
-            index,
-            detail=(
-                f"Current:\n{slide_path.name}\n\n"
-                f"Accepted: {latest.accepted_tiles}\n"
-                f"Rejected: {latest.rejected_tiles}\n"
-                f"Elapsed: {_format_duration(time.perf_counter() - batch_start)}"
-            ),
-        )
+            completed = 0
+            for future in concurrent.futures.as_completed(futures):
+                fallback_index, fallback_slide_path = futures[future]
+                try:
+                    index, result = future.result()
+                except Exception as exc:  # noqa: BLE001 - preserve batch summary on worker crashes
+                    index = fallback_index
+                    result = BatchSlideResult(
+                        wsi_filename=fallback_slide_path.name,
+                        slide_name=fallback_slide_path.stem,
+                        output_dir=output_path / fallback_slide_path.stem,
+                        completion_timestamp=_timestamp(),
+                        status="Failed",
+                        error=str(exc),
+                    )
+                    _write_failure_log(result.output_dir / "logs" / "processing.log", exc)
+                ordered_results[index] = result
+                completed += 1
+                _report_batch_result(result)
+                overall.update(
+                    completed,
+                    detail=_overall_progress_detail(result, batch_start),
+                )
+
+        results = [ordered_results[index] for index in sorted(ordered_results)]
 
     batch_summary_path = output_path / str(batch_cfg.get("batch_summary_filename", "batch_summary.csv"))
     export_batch_summary(results, batch_summary_path)
     overall.finish(detail=f"Batch summary:\n{batch_summary_path}")
     return results
+
+
+def _process_batch_slide_item_worker(
+    index: int,
+    slide_path: str,
+    output_path: str,
+    base_config: Mapping[str, Any],
+    marker_name: str,
+    force: bool,
+    return_images: bool,
+) -> tuple[int, BatchSlideResult]:
+    result = _process_batch_slide_item(
+        index=index,
+        slide_path=Path(slide_path),
+        output_path=Path(output_path),
+        base_config=base_config,
+        marker_name=marker_name,
+        force=force,
+        return_images=return_images,
+        slide_factory=None,
+        show_tile_progress=False,
+        print_summary=False,
+    )
+    return index, result
+
+
+def _process_batch_slide_item(
+    index: int,
+    slide_path: Path,
+    output_path: Path,
+    base_config: Mapping[str, Any],
+    marker_name: str,
+    force: bool,
+    return_images: bool,
+    slide_factory: Callable[[Path], Any] | None,
+    show_tile_progress: bool,
+    print_summary: bool,
+) -> BatchSlideResult:
+    del index  # Ordering is handled by the caller.
+    slide_start = time.perf_counter()
+    slide_name = slide_path.stem
+    slide_output_dir = output_path / slide_name
+    marker_path = slide_output_dir / marker_name
+
+    if _is_slide_completed(slide_output_dir, marker_name) and not force:
+        marker_data = _read_completion_marker(marker_path)
+        result = _result_from_marker(slide_path, slide_output_dir, marker_data)
+        result.status = "Skipped"
+        return result
+
+    if force and slide_output_dir.exists():
+        shutil.rmtree(slide_output_dir)
+
+    _create_slide_output_layout(slide_output_dir)
+    slide_config = _build_batch_slide_config(base_config, slide_path, slide_output_dir)
+    _write_config_snapshot(slide_config, slide_output_dir / "logs" / "configuration_snapshot.yaml")
+    tile_progress_holder: dict[str, ProgressPrinter] = {}
+
+    def _tile_progress(current: int, total: int, label: str) -> None:
+        progress = tile_progress_holder.get("progress")
+        if progress is None or progress.total != total:
+            progress = ProgressPrinter("Tile generation", total, enabled=show_tile_progress)
+            tile_progress_holder["progress"] = progress
+        progress.update(
+            current,
+            detail=(
+                f"Current:\n{slide_path.name}\n\n"
+                f"Stage: {label}"
+            ),
+        )
+
+    try:
+        with _slide_file_logging(slide_output_dir / "logs" / "processing.log"):
+            LOGGER.info("Starting WSI batch item: %s", slide_path)
+            slide_obj = slide_factory(slide_path) if slide_factory else None
+            try:
+                tile_results = generate_tiles(
+                    config=slide_config,
+                    slide=slide_obj,
+                    return_images=return_images,
+                    save_to_disk=True,
+                    progress_callback=_tile_progress if show_tile_progress else None,
+                )
+            finally:
+                if slide_obj is not None and hasattr(slide_obj, "close"):
+                    slide_obj.close()
+
+            statistics = dict(tile_results["statistics"])
+            elapsed = time.perf_counter() - slide_start
+            result = BatchSlideResult(
+                wsi_filename=slide_path.name,
+                slide_name=slide_name,
+                output_dir=slide_output_dir,
+                accepted_tiles=int(statistics.get("accepted_tiles", 0)),
+                rejected_tiles=int(statistics.get("rejected_tiles", 0)),
+                total_tiles=int(statistics.get("candidate_tiles", 0)),
+                tissue_area=int(statistics.get("tissue_area", 0)),
+                processing_time_seconds=elapsed,
+                completion_timestamp=_timestamp(),
+                status="Completed",
+            )
+            _write_completion_marker(marker_path, result, statistics)
+            LOGGER.info("Completed WSI batch item: %s", slide_path)
+            if print_summary:
+                _print_slide_summary(result)
+            return result
+    except Exception as exc:  # noqa: BLE001 - batch processing should continue
+        elapsed = time.perf_counter() - slide_start
+        result = BatchSlideResult(
+            wsi_filename=slide_path.name,
+            slide_name=slide_name,
+            output_dir=slide_output_dir,
+            processing_time_seconds=elapsed,
+            completion_timestamp=_timestamp(),
+            status="Failed",
+            error=str(exc),
+        )
+        _write_failure_log(slide_output_dir / "logs" / "processing.log", exc)
+        return result
+
+
+def _report_batch_result(result: BatchSlideResult) -> None:
+    if result.status == "Completed":
+        _print_slide_summary(result)
+    elif result.status == "Skipped":
+        print(f"Skipped (already processed): {result.wsi_filename}", flush=True)
+    elif result.status == "Failed":
+        print(f"Failed: {result.wsi_filename}: {result.error}", flush=True)
+
+
+def _overall_progress_detail(result: BatchSlideResult, batch_start: float) -> str:
+    return (
+        f"Current:\n{result.wsi_filename}\n\n"
+        f"Accepted: {result.accepted_tiles}\n"
+        f"Rejected: {result.rejected_tiles}\n"
+        f"Elapsed: {_format_duration(time.perf_counter() - batch_start)}"
+    )
 
 
 def discover_wsi_files(input_dir: str | Path) -> list[Path]:
@@ -1813,6 +1913,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output-dir", help="Override output_dir from the config.")
     parser.add_argument("--input-dir", help="Batch input directory containing .tif/.tiff WSIs.")
     parser.add_argument("--force", action="store_true", help="Overwrite existing completed WSI outputs.")
+    parser.add_argument("--workers", type=int, help="Number of parallel WSI workers for batch mode.")
     parser.add_argument("--no-progress", action="store_true", help="Disable terminal progress bars.")
     args = parser.parse_args(argv)
 
@@ -1831,6 +1932,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             force=args.force,
             return_images=False,
             show_progress=not args.no_progress,
+            workers=args.workers,
         )
         return 0
 
