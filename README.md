@@ -64,6 +64,20 @@ batch runner will re-enter the partial slide folder, validate existing tile
 images, skip valid files, regenerate missing/corrupt files, and then write the
 completion marker.
 
+QC after batch:
+
+```bash
+python -m tile_generator \
+  --qc-output-dir output \
+  --qc-sample-size 25 \
+  --qc-tile-size 512
+```
+
+This writes `output/batch_qc_summary.csv` and `output/batch_qc_report.json`.
+QC checks completion markers, metadata/file count consistency, coordinate-based
+filenames, duplicate tile IDs, required visualization/log files, and sampled
+tile image sizes.
+
 ## Direct API
 
 ```python

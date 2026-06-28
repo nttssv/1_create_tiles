@@ -49,6 +49,7 @@ COORDINATE_FILENAME_RE = re.compile(
     r"^[A-Za-z0-9-]+_x(?P<x>-?\d+)_y(?P<y>-?\d+)(?:_c(?P<c>\d+))?(?:_[A-Za-z0-9-]+)?\.[^.]+$"
 )
 SUPPORTED_WSI_EXTENSIONS = {".tif", ".tiff"}
+TILE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -267,19 +268,21 @@ class ProgressPrinter:
         self.width = max(10, int(width))
         self.enabled = enabled
         self.start_time = time.perf_counter()
-        self.current = 0
+        self.current = 0.0
 
-    def update(self, current: int, detail: str = "") -> None:
-        self.current = max(0, min(int(current), self.total if self.total else int(current)))
+    def update(self, current: int | float, detail: str = "") -> None:
+        numeric_current = float(current)
+        self.current = max(0.0, min(numeric_current, float(self.total) if self.total else numeric_current))
         if not self.enabled:
             return
         elapsed = time.perf_counter() - self.start_time
         eta = _estimate_eta(elapsed, self.current, self.total)
         filled = self.width if self.total == 0 else int(self.width * self.current / max(1, self.total))
         bar = "█" * filled + "-" * (self.width - filled)
+        current_label = _format_progress_current(self.current)
         lines = [
             self.label,
-            f"{bar} {self.current}/{self.total}",
+            f"{bar} {current_label}/{self.total}",
         ]
         if detail:
             lines.append(detail)
@@ -1582,8 +1585,12 @@ def process_wsi_batch(
                         finished_wsi,
                     ):
                         overall.update(
-                            completed,
-                            detail=_parallel_progress_detail(worker_states, batch_start),
+                            _effective_batch_progress(completed, worker_states),
+                            detail=_parallel_progress_detail(
+                                worker_states,
+                                completed_slides=completed,
+                                total_slides=len(wsi_files),
+                            ),
                         )
                     for future in done:
                         fallback_index, fallback_slide_path = futures[future]
@@ -1606,7 +1613,7 @@ def process_wsi_batch(
                         worker_states.pop(result.wsi_filename, None)
                         _report_batch_result(result)
                         overall.update(
-                            completed,
+                            _effective_batch_progress(completed, worker_states),
                             detail=_overall_progress_detail(result, batch_start),
                         )
                 if progress_queue is not None and _drain_progress_events(
@@ -1615,8 +1622,12 @@ def process_wsi_batch(
                     finished_wsi,
                 ):
                     overall.update(
-                        completed,
-                        detail=_parallel_progress_detail(worker_states, batch_start),
+                        _effective_batch_progress(completed, worker_states),
+                        detail=_parallel_progress_detail(
+                            worker_states,
+                            completed_slides=completed,
+                            total_slides=len(wsi_files),
+                        ),
                     )
 
         results = [ordered_results[index] for index in sorted(ordered_results)]
@@ -1865,9 +1876,12 @@ def _drain_progress_events(
     return updated
 
 
-def _parallel_progress_detail(worker_states: Mapping[str, Mapping[str, Any]], batch_start: float) -> str:
-    del batch_start  # Elapsed time is printed by ProgressPrinter.
-    lines: list[str] = []
+def _parallel_progress_detail(
+    worker_states: Mapping[str, Mapping[str, Any]],
+    completed_slides: int,
+    total_slides: int,
+) -> str:
+    lines: list[str] = [f"Completed WSIs: {completed_slides}/{total_slides}"]
     if not worker_states:
         lines.append("Waiting for workers...")
         return "\n".join(lines)
@@ -1884,6 +1898,17 @@ def _parallel_progress_detail(worker_states: Mapping[str, Mapping[str, Any]], ba
     if len(worker_states) > 8:
         lines.append(f"... {len(worker_states) - 8} more active workers")
     return "\n".join(lines)
+
+
+def _effective_batch_progress(completed_slides: int, worker_states: Mapping[str, Mapping[str, Any]]) -> float:
+    effective = float(completed_slides)
+    for state in worker_states.values():
+        current = float(state.get("current", 0) or 0)
+        total = float(state.get("total", 0) or 0)
+        if total <= 0:
+            continue
+        effective += min(0.999, max(0.0, current / total))
+    return effective
 
 
 def _overall_progress_detail(result: BatchSlideResult, batch_start: float) -> str:
@@ -1992,6 +2017,318 @@ def export_batch_summary(results: Sequence[BatchSlideResult], csv_path: str | Pa
             )
     LOGGER.info("Exported batch summary to %s.", path)
     return path
+
+
+def qc_batch_output(
+    output_dir: str | Path,
+    sample_size: int = 25,
+    expected_tile_size: int = 512,
+) -> dict[str, Any]:
+    """Validate a batch tile-output folder and write QC summaries."""
+
+    output_path = Path(output_dir)
+    if not output_path.exists() or not output_path.is_dir():
+        raise TileGenerationError(f"QC output directory does not exist: {output_path}")
+
+    slide_dirs = sorted(
+        [path for path in output_path.iterdir() if path.is_dir() and not path.name.startswith(".")],
+        key=lambda path: path.name.lower(),
+    )
+    if not slide_dirs:
+        raise TileGenerationError(f"No per-slide output folders found in {output_path}")
+
+    rows = [
+        _qc_slide_output(slide_dir, sample_size=max(0, int(sample_size)), expected_tile_size=expected_tile_size)
+        for slide_dir in slide_dirs
+    ]
+    summary_path = output_path / "batch_qc_summary.csv"
+    report_path = output_path / "batch_qc_report.json"
+    _write_qc_summary(rows, summary_path)
+    report = {
+        "output_dir": str(output_path),
+        "slide_count": len(rows),
+        "passed": sum(1 for row in rows if row["qc_status"] == "PASS"),
+        "failed": sum(1 for row in rows if row["qc_status"] == "FAIL"),
+        "sample_size_per_slide": int(sample_size),
+        "expected_tile_size": int(expected_tile_size),
+        "generated_at": _timestamp(),
+        "slides": rows,
+    }
+    with report_path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2)
+        handle.write("\n")
+
+    print(
+        (
+            f"QC complete: {report['passed']} PASS, {report['failed']} FAIL. "
+            f"Summary: {summary_path}. Report: {report_path}"
+        ),
+        flush=True,
+    )
+    return {"rows": rows, "summary_path": summary_path, "report_path": report_path, "report": report}
+
+
+def _qc_slide_output(slide_dir: Path, sample_size: int, expected_tile_size: int) -> dict[str, Any]:
+    metadata_path = slide_dir / "metadata" / "tile_metadata.csv"
+    coordinates_path = slide_dir / "metadata" / "tile_coordinates.csv"
+    summary_path = slide_dir / "metadata" / "tile_summary.csv"
+    statistics_path = slide_dir / "metadata" / "tile_statistics.json"
+    accepted_dir = slide_dir / "tiles" / "accepted_tiles"
+    rejected_dir = slide_dir / "tiles" / "rejected_tiles"
+    visualization_path = slide_dir / "visualization" / "patient_tile_map.png"
+    tissue_mask_path = slide_dir / "visualization" / "tissue_mask.png"
+    log_path = slide_dir / "logs" / "processing.log"
+    marker_path = slide_dir / "_COMPLETED.json"
+
+    issues: list[str] = []
+    marker_status = "missing"
+    if marker_path.exists():
+        marker = _read_json_file(marker_path)
+        marker_status = str(marker.get("status", "unknown")) if marker else "unreadable"
+        if marker_status not in {"Completed", "Skipped"}:
+            issues.append(f"completion_marker_status={marker_status}")
+    else:
+        issues.append("missing_completion_marker")
+
+    accepted_files = _tile_image_files(accepted_dir)
+    rejected_files = _tile_image_files(rejected_dir)
+    metadata_rows = _read_csv_rows(metadata_path)
+    coordinate_rows = _read_csv_rows(coordinates_path)
+    summary_rows = _read_csv_rows(summary_path)
+
+    if not metadata_path.exists():
+        issues.append("missing_tile_metadata_csv")
+    if not coordinates_path.exists():
+        issues.append("missing_tile_coordinates_csv")
+    if not summary_path.exists():
+        issues.append("missing_tile_summary_csv")
+    if not statistics_path.exists():
+        issues.append("missing_tile_statistics_json")
+    if not accepted_dir.exists():
+        issues.append("missing_accepted_tiles_dir")
+    if not visualization_path.exists():
+        issues.append("missing_patient_tile_map_png")
+    if not tissue_mask_path.exists():
+        issues.append("missing_tissue_mask_png")
+    if not log_path.exists():
+        issues.append("missing_processing_log")
+
+    accepted_rows = [row for row in metadata_rows if str(row.get("tile_status", "")).lower() == "accepted"]
+    rejected_rows = [row for row in metadata_rows if str(row.get("tile_status", "")).lower() == "rejected"]
+    duplicate_tile_ids = _count_duplicates([str(row.get("tile_id", "")) for row in metadata_rows if row.get("tile_id")])
+    if duplicate_tile_ids:
+        issues.append(f"duplicate_tile_ids={duplicate_tile_ids}")
+
+    filename_coordinate_mismatches = _count_filename_coordinate_mismatches(metadata_rows)
+    if filename_coordinate_mismatches:
+        issues.append(f"filename_coordinate_mismatches={filename_coordinate_mismatches}")
+
+    missing_tile_files = _count_missing_metadata_files(metadata_rows, accepted_dir, rejected_dir)
+    if missing_tile_files:
+        issues.append(f"metadata_rows_missing_tile_file={missing_tile_files}")
+
+    if metadata_rows:
+        if len(accepted_files) != len(accepted_rows):
+            issues.append(f"accepted_file_count_mismatch={len(accepted_files)}!={len(accepted_rows)}")
+        if rejected_rows and len(rejected_files) != len(rejected_rows):
+            issues.append(f"rejected_file_count_mismatch={len(rejected_files)}!={len(rejected_rows)}")
+        if coordinate_rows and len(coordinate_rows) != len(metadata_rows):
+            issues.append(f"coordinate_row_count_mismatch={len(coordinate_rows)}!={len(metadata_rows)}")
+        if summary_rows:
+            summary = summary_rows[0]
+            expected_accepted = _safe_int(summary.get("accepted_tiles"))
+            expected_rejected = _safe_int(summary.get("rejected_tiles"))
+            expected_candidates = _safe_int(summary.get("candidate_tiles"))
+            if expected_accepted is not None and expected_accepted != len(accepted_rows):
+                issues.append(f"summary_accepted_mismatch={expected_accepted}!={len(accepted_rows)}")
+            if expected_rejected is not None and expected_rejected != len(rejected_rows):
+                issues.append(f"summary_rejected_mismatch={expected_rejected}!={len(rejected_rows)}")
+            if expected_candidates is not None and expected_candidates != len(metadata_rows):
+                issues.append(f"summary_candidate_mismatch={expected_candidates}!={len(metadata_rows)}")
+
+    metadata_by_filename = {str(row.get("tile_filename", "")): row for row in metadata_rows}
+    sample_files = _deterministic_sample(accepted_files + rejected_files, sample_size)
+    invalid_sample_images = _count_invalid_sample_images(sample_files, metadata_by_filename, expected_tile_size)
+    if invalid_sample_images:
+        issues.append(f"invalid_sample_images={invalid_sample_images}")
+
+    return {
+        "slide_name": slide_dir.name,
+        "qc_status": "FAIL" if issues else "PASS",
+        "issues": ";".join(issues),
+        "marker_status": marker_status,
+        "metadata_exists": metadata_path.exists(),
+        "coordinates_exists": coordinates_path.exists(),
+        "summary_exists": summary_path.exists(),
+        "statistics_exists": statistics_path.exists(),
+        "accepted_files": len(accepted_files),
+        "rejected_files": len(rejected_files),
+        "metadata_rows": len(metadata_rows),
+        "metadata_accepted_rows": len(accepted_rows),
+        "metadata_rejected_rows": len(rejected_rows),
+        "coordinate_rows": len(coordinate_rows),
+        "missing_tile_files": missing_tile_files,
+        "filename_coordinate_mismatches": filename_coordinate_mismatches,
+        "duplicate_tile_ids": duplicate_tile_ids,
+        "sample_checked": len(sample_files),
+        "invalid_sample_images": invalid_sample_images,
+        "visualization_exists": visualization_path.exists(),
+        "tissue_mask_exists": tissue_mask_path.exists(),
+        "log_exists": log_path.exists(),
+    }
+
+
+def _write_qc_summary(rows: Sequence[Mapping[str, Any]], csv_path: Path) -> Path:
+    fieldnames = [
+        "slide_name",
+        "qc_status",
+        "issues",
+        "marker_status",
+        "metadata_exists",
+        "coordinates_exists",
+        "summary_exists",
+        "statistics_exists",
+        "accepted_files",
+        "rejected_files",
+        "metadata_rows",
+        "metadata_accepted_rows",
+        "metadata_rejected_rows",
+        "coordinate_rows",
+        "missing_tile_files",
+        "filename_coordinate_mismatches",
+        "duplicate_tile_ids",
+        "sample_checked",
+        "invalid_sample_images",
+        "visualization_exists",
+        "tissue_mask_exists",
+        "log_exists",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
+    return csv_path
+
+
+def _read_csv_rows(csv_path: Path) -> list[dict[str, str]]:
+    if not csv_path.exists():
+        return []
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+    except OSError:
+        return []
+
+
+def _read_json_file(json_path: Path) -> dict[str, Any]:
+    if not json_path.exists():
+        return {}
+    try:
+        with json_path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _tile_image_files(directory: Path) -> list[Path]:
+    if not directory.exists():
+        return []
+    return sorted(
+        [
+            path
+            for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower() in TILE_IMAGE_EXTENSIONS
+        ],
+        key=lambda path: path.name.lower(),
+    )
+
+
+def _count_duplicates(values: Sequence[str]) -> int:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for value in values:
+        if value in seen:
+            duplicates.add(value)
+        else:
+            seen.add(value)
+    return len(duplicates)
+
+
+def _count_filename_coordinate_mismatches(rows: Sequence[Mapping[str, Any]]) -> int:
+    mismatches = 0
+    for row in rows:
+        filename = str(row.get("tile_filename", ""))
+        try:
+            x, y = filename_to_coordinate(filename)
+            row_x = int(str(row.get("level0_x", "")))
+            row_y = int(str(row.get("level0_y", "")))
+        except (TypeError, ValueError, TileGenerationError):
+            mismatches += 1
+            continue
+        if x != row_x or y != row_y:
+            mismatches += 1
+    return mismatches
+
+
+def _count_missing_metadata_files(
+    rows: Sequence[Mapping[str, Any]],
+    accepted_dir: Path,
+    rejected_dir: Path,
+) -> int:
+    missing = 0
+    for row in rows:
+        filename = str(row.get("tile_filename", ""))
+        if not filename:
+            missing += 1
+            continue
+        status = str(row.get("tile_status", "")).lower()
+        directory = accepted_dir if status == "accepted" else rejected_dir
+        if not (directory / filename).exists():
+            missing += 1
+    return missing
+
+
+def _deterministic_sample(paths: Sequence[Path], sample_size: int) -> list[Path]:
+    if sample_size <= 0 or not paths:
+        return []
+    sorted_paths = sorted(paths, key=lambda path: str(path))
+    if len(sorted_paths) <= sample_size:
+        return list(sorted_paths)
+    if sample_size == 1:
+        return [sorted_paths[0]]
+    indexes = {
+        int(round(i * (len(sorted_paths) - 1) / (sample_size - 1)))
+        for i in range(sample_size)
+    }
+    return [sorted_paths[index] for index in sorted(indexes)]
+
+
+def _count_invalid_sample_images(
+    sample_files: Sequence[Path],
+    metadata_by_filename: Mapping[str, Mapping[str, Any]],
+    expected_tile_size: int,
+) -> int:
+    invalid = 0
+    for path in sample_files:
+        row = metadata_by_filename.get(path.name, {})
+        expected_width = _safe_int(row.get("tile_width")) or int(expected_tile_size)
+        expected_height = _safe_int(row.get("tile_height")) or int(expected_tile_size)
+        try:
+            with Image.open(path) as image:
+                if image.size != (expected_width, expected_height):
+                    invalid += 1
+        except (OSError, ValueError):
+            invalid += 1
+    return invalid
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(float(str(value)))
+    except (TypeError, ValueError):
+        return None
 
 
 def _build_batch_slide_config(
@@ -2220,6 +2557,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--slide", help="Override slide_path from the config.")
     parser.add_argument("--output-dir", help="Override output_dir from the config.")
     parser.add_argument("--input-dir", help="Batch input directory containing .tif/.tiff WSIs.")
+    parser.add_argument("--qc-output-dir", help="Run QC on a batch output directory and exit.")
+    parser.add_argument("--qc-sample-size", type=int, default=25, help="Tile image samples per WSI for QC.")
+    parser.add_argument("--qc-tile-size", type=int, default=512, help="Expected native tile size for QC samples.")
     parser.add_argument("--force", action="store_true", help="Overwrite existing completed WSI outputs.")
     parser.add_argument("--workers", type=int, help="Number of parallel WSI workers for batch mode.")
     parser.add_argument(
@@ -2236,6 +2576,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     cfg_for_mode = load_config(args.config)
+    if args.qc_output_dir:
+        qc_batch_output(
+            args.qc_output_dir,
+            sample_size=args.qc_sample_size,
+            expected_tile_size=args.qc_tile_size,
+        )
+        return 0
+
     batch_input_dir = args.input_dir or cfg_for_mode.get("batch", {}).get("input_dir")
     if batch_input_dir:
         batch_output_dir = (
@@ -2333,7 +2681,13 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
-def _estimate_eta(elapsed: float, current: int, total: int) -> float | None:
+def _format_progress_current(current: float) -> str:
+    if abs(current - round(current)) < 0.005:
+        return str(int(round(current)))
+    return f"{current:.2f}"
+
+
+def _estimate_eta(elapsed: float, current: float, total: int) -> float | None:
     if current <= 0 or total <= 0 or current >= total:
         return None
     rate = elapsed / current

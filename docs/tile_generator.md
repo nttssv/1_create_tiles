@@ -349,10 +349,40 @@ Batch mode prints an overall WSI progress bar while accepted/rejected tile files
 are written. With `--workers > 1`, worker processes send throttled progress
 events back to the main process, so the terminal shows active WSIs, tile counts,
 and the last coordinate-named tile file saved or skipped by each worker. Each
-slide also writes its own `logs/processing.log`.
+slide also writes its own `logs/processing.log`. The overall ETA uses completed
+WSIs plus fractional tile-save progress from active workers, so the progress bar
+may show values such as `12.35/14` while parallel slides are still running.
 
 Parallelization is across WSIs, not within a single WSI. Each worker opens its
 own OpenSlide handle and writes to a dedicated slide output folder.
+
+## QC After Batch
+
+Run QC after the batch command finishes:
+
+```bash
+python -m tile_generator \
+  --qc-output-dir output \
+  --qc-sample-size 25 \
+  --qc-tile-size 512
+```
+
+The QC command writes:
+
+```text
+output/batch_qc_summary.csv
+output/batch_qc_report.json
+```
+
+Checks include:
+
+- completion marker presence and status
+- metadata, coordinate, summary, statistics, visualization, tissue mask, and log files
+- accepted/rejected file counts versus metadata rows
+- coordinate filename consistency with `level0_x` and `level0_y`
+- duplicate tile IDs
+- missing tile files referenced by metadata
+- sampled tile image readability and expected tile size
 
 ## Multiprocessing Notes
 
