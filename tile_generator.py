@@ -1490,6 +1490,7 @@ def process_wsi_batch(
                 slide_factory=slide_factory,
                 show_tile_progress=show_progress,
                 print_summary=False,
+                prefix_logs=False,
             )
             results.append(result)
             _report_batch_result(result)
@@ -1570,6 +1571,7 @@ def _process_batch_slide_item_worker(
         slide_factory=None,
         show_tile_progress=False,
         print_summary=False,
+        prefix_logs=True,
     )
     return index, result
 
@@ -1586,6 +1588,7 @@ def _process_batch_slide_item(
     slide_factory: Callable[[Path], Any] | None,
     show_tile_progress: bool,
     print_summary: bool,
+    prefix_logs: bool = False,
 ) -> BatchSlideResult:
     del index  # Ordering is handled by the caller.
     slide_start = time.perf_counter()
@@ -1635,46 +1638,48 @@ def _process_batch_slide_item(
 
     try:
         with _slide_file_logging(slide_output_dir / "logs" / "processing.log"):
-            LOGGER.info("Starting WSI batch item: %s", slide_path)
-            if existing_counts["total"] > 0:
-                LOGGER.info(
-                    "Resuming partial output for %s: %s accepted files, %s rejected files already exist.",
-                    slide_path.name,
-                    existing_counts["accepted"],
-                    existing_counts["rejected"],
-                )
-            slide_obj = slide_factory(slide_path) if slide_factory else None
-            try:
-                tile_results = generate_tiles(
-                    config=slide_config,
-                    slide=slide_obj,
-                    return_images=return_images,
-                    save_to_disk=True,
-                    progress_callback=_tile_progress if show_tile_progress else None,
-                )
-            finally:
-                if slide_obj is not None and hasattr(slide_obj, "close"):
-                    slide_obj.close()
+            log_context = _slide_log_prefix(slide_path.name) if prefix_logs else contextlib.nullcontext()
+            with log_context:
+                LOGGER.info("Starting WSI batch item: %s", slide_path)
+                if existing_counts["total"] > 0:
+                    LOGGER.info(
+                        "Resuming partial output for %s: %s accepted files, %s rejected files already exist.",
+                        slide_path.name,
+                        existing_counts["accepted"],
+                        existing_counts["rejected"],
+                    )
+                slide_obj = slide_factory(slide_path) if slide_factory else None
+                try:
+                    tile_results = generate_tiles(
+                        config=slide_config,
+                        slide=slide_obj,
+                        return_images=return_images,
+                        save_to_disk=True,
+                        progress_callback=_tile_progress if show_tile_progress else None,
+                    )
+                finally:
+                    if slide_obj is not None and hasattr(slide_obj, "close"):
+                        slide_obj.close()
 
-            statistics = dict(tile_results["statistics"])
-            elapsed = time.perf_counter() - slide_start
-            result = BatchSlideResult(
-                wsi_filename=slide_path.name,
-                slide_name=slide_name,
-                output_dir=slide_output_dir,
-                accepted_tiles=int(statistics.get("accepted_tiles", 0)),
-                rejected_tiles=int(statistics.get("rejected_tiles", 0)),
-                total_tiles=int(statistics.get("candidate_tiles", 0)),
-                tissue_area=int(statistics.get("tissue_area", 0)),
-                processing_time_seconds=elapsed,
-                completion_timestamp=_timestamp(),
-                status="Completed",
-            )
-            _write_completion_marker(marker_path, result, statistics)
-            LOGGER.info("Completed WSI batch item: %s", slide_path)
-            if print_summary:
-                _print_slide_summary(result)
-            return result
+                statistics = dict(tile_results["statistics"])
+                elapsed = time.perf_counter() - slide_start
+                result = BatchSlideResult(
+                    wsi_filename=slide_path.name,
+                    slide_name=slide_name,
+                    output_dir=slide_output_dir,
+                    accepted_tiles=int(statistics.get("accepted_tiles", 0)),
+                    rejected_tiles=int(statistics.get("rejected_tiles", 0)),
+                    total_tiles=int(statistics.get("candidate_tiles", 0)),
+                    tissue_area=int(statistics.get("tissue_area", 0)),
+                    processing_time_seconds=elapsed,
+                    completion_timestamp=_timestamp(),
+                    status="Completed",
+                )
+                _write_completion_marker(marker_path, result, statistics)
+                LOGGER.info("Completed WSI batch item: %s", slide_path)
+                if print_summary:
+                    _print_slide_summary(result)
+                return result
     except Exception as exc:  # noqa: BLE001 - batch processing should continue
         elapsed = time.perf_counter() - slide_start
         result = BatchSlideResult(
@@ -1940,6 +1945,34 @@ def _slide_file_logging(log_path: Path) -> Any:
     finally:
         root_logger.removeHandler(handler)
         handler.close()
+
+
+class _SlideLogPrefixFilter(logging.Filter):
+    def __init__(self, slide_name: str) -> None:
+        super().__init__()
+        self.slide_name = slide_name
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "_slide_name_prefixed", False):
+            return True
+        record.msg = f"[{self.slide_name}] {record.getMessage()}"
+        record.args = ()
+        record._slide_name_prefixed = True
+        return True
+
+
+@contextlib.contextmanager
+def _slide_log_prefix(slide_name: str) -> Any:
+    root_logger = logging.getLogger()
+    log_filter = _SlideLogPrefixFilter(slide_name)
+    handlers = list(root_logger.handlers)
+    for handler in handlers:
+        handler.addFilter(log_filter)
+    try:
+        yield
+    finally:
+        for handler in handlers:
+            handler.removeFilter(log_filter)
 
 
 def _write_failure_log(log_path: Path, exc: Exception) -> None:
