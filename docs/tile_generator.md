@@ -347,9 +347,10 @@ After all WSIs finish, the runner writes:
 output/batch_summary.csv
 ```
 
-The batch summary has one row per WSI with filename, accepted tiles, rejected
-tiles, total tiles, tissue area, processing time, completion timestamp, status,
-output folder, and any error message.
+The batch summary has one row per WSI with filename, source WSI file size
+(`bytes`, `MB`, and `GB`), accepted tiles, rejected tiles, total tiles, tissue
+area, processing time, completion timestamp, status, output folder, and any
+error message.
 
 Batch mode prints an overall WSI progress bar while accepted/rejected tile files
 are written. With `--workers > 1`, worker processes send throttled progress

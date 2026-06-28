@@ -255,6 +255,7 @@ class BatchSlideResult:
     wsi_filename: str
     slide_name: str
     output_dir: Path
+    source_file_size_bytes: int = 0
     accepted_tiles: int = 0
     rejected_tiles: int = 0
     total_tiles: int = 0
@@ -1608,6 +1609,7 @@ def process_wsi_batch(
                                 wsi_filename=fallback_slide_path.name,
                                 slide_name=fallback_slide_path.stem,
                                 output_dir=output_path / fallback_slide_path.stem,
+                                source_file_size_bytes=_file_size_bytes(fallback_slide_path),
                                 completion_timestamp=_timestamp(),
                                 status="Failed",
                                 error=str(exc),
@@ -1699,6 +1701,7 @@ def _process_batch_slide_item(
     slide_name = slide_path.stem
     slide_output_dir = output_path / slide_name
     marker_path = slide_output_dir / marker_name
+    source_file_size_bytes = _file_size_bytes(slide_path)
 
     if _is_slide_completed(slide_output_dir, marker_name) and not force:
         marker_data = _read_completion_marker(marker_path)
@@ -1713,6 +1716,7 @@ def _process_batch_slide_item(
             wsi_filename=slide_path.name,
             slide_name=slide_name,
             output_dir=slide_output_dir,
+            source_file_size_bytes=source_file_size_bytes,
             completion_timestamp=_timestamp(),
             status="Failed",
             error=(
@@ -1813,6 +1817,7 @@ def _process_batch_slide_item(
                     wsi_filename=slide_path.name,
                     slide_name=slide_name,
                     output_dir=slide_output_dir,
+                    source_file_size_bytes=source_file_size_bytes,
                     accepted_tiles=int(statistics.get("accepted_tiles", 0)),
                     rejected_tiles=int(statistics.get("rejected_tiles", 0)),
                     total_tiles=int(statistics.get("candidate_tiles", 0)),
@@ -1832,6 +1837,7 @@ def _process_batch_slide_item(
             wsi_filename=slide_path.name,
             slide_name=slide_name,
             output_dir=slide_output_dir,
+            source_file_size_bytes=source_file_size_bytes,
             processing_time_seconds=elapsed,
             completion_timestamp=_timestamp(),
             status="Failed",
@@ -1991,6 +1997,9 @@ def export_batch_summary(results: Sequence[BatchSlideResult], csv_path: str | Pa
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "WSI filename",
+        "WSI file size bytes",
+        "WSI file size MB",
+        "WSI file size GB",
         "accepted tiles",
         "rejected tiles",
         "total tiles",
@@ -2009,6 +2018,9 @@ def export_batch_summary(results: Sequence[BatchSlideResult], csv_path: str | Pa
             writer.writerow(
                 {
                     "WSI filename": result.wsi_filename,
+                    "WSI file size bytes": result.source_file_size_bytes,
+                    "WSI file size MB": f"{_bytes_to_megabytes(result.source_file_size_bytes):.3f}",
+                    "WSI file size GB": f"{_bytes_to_gigabytes(result.source_file_size_bytes):.3f}",
                     "accepted tiles": result.accepted_tiles,
                     "rejected tiles": result.rejected_tiles,
                     "total tiles": result.total_tiles,
@@ -2428,6 +2440,9 @@ def _result_from_marker(
         wsi_filename=slide_path.name,
         slide_name=slide_path.stem,
         output_dir=slide_output_dir,
+        source_file_size_bytes=int(
+            marker_data.get("source_file_size_bytes", _file_size_bytes(slide_path)) or 0
+        ),
         accepted_tiles=int(statistics.get("accepted_tiles", marker_data.get("accepted_tiles", 0)) or 0),
         rejected_tiles=int(statistics.get("rejected_tiles", marker_data.get("rejected_tiles", 0)) or 0),
         total_tiles=int(statistics.get("candidate_tiles", marker_data.get("total_tiles", 0)) or 0),
@@ -2466,6 +2481,7 @@ def _write_completion_marker(
     payload = {
         "wsi_filename": result.wsi_filename,
         "slide_name": result.slide_name,
+        "source_file_size_bytes": result.source_file_size_bytes,
         "accepted_tiles": result.accepted_tiles,
         "rejected_tiles": result.rejected_tiles,
         "total_tiles": result.total_tiles,
@@ -2724,6 +2740,21 @@ def _coordinate_tile_id(x: int, y: int) -> str:
 
 def _timestamp() -> str:
     return dt.datetime.now().isoformat(timespec="seconds")
+
+
+def _file_size_bytes(path: str | Path) -> int:
+    try:
+        return int(Path(path).stat().st_size)
+    except OSError:
+        return 0
+
+
+def _bytes_to_megabytes(size_bytes: int | float) -> float:
+    return float(size_bytes or 0) / 1024**2
+
+
+def _bytes_to_gigabytes(size_bytes: int | float) -> float:
+    return float(size_bytes or 0) / 1024**3
 
 
 def _format_duration(seconds: float) -> str:

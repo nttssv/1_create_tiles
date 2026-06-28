@@ -59,6 +59,7 @@ output/26RR000079-A-01-01/
 
 Use `--force` to overwrite a completed WSI output. Otherwise, completed slides
 are skipped automatically and `output/batch_summary.csv` is updated.
+The batch summary includes each source WSI file size in bytes, MB, and GB.
 Parallel workers run at the WSI level; each worker opens its own slide and
 writes to a dedicated output folder.
 The terminal progress display updates while tiles are saved or skipped,
