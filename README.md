@@ -83,6 +83,22 @@ QC checks completion markers, metadata/file count consistency, coordinate-based
 filenames, duplicate tile IDs, required visualization/log files, and sampled
 tile image sizes.
 
+Rename unreadable input WSIs after QC:
+
+```bash
+python examples/rename_unreadable_wsi.py \
+  --input-dir raw_images \
+  --batch-summary output/batch_summary.csv
+
+python examples/rename_unreadable_wsi.py \
+  --input-dir raw_images \
+  --batch-summary output/batch_summary.csv \
+  --apply
+```
+
+The first command is a dry run. The second renames files unreadable by both
+OpenSlide and tiffslide, for example `MTO107_CORRUPT.tiff`.
+
 ## Direct API
 
 ```python
