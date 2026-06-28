@@ -1,0 +1,102 @@
+# Standalone WSI tile-generation config.
+# The downstream inference pipeline should continue reading 512x512 image tiles.
+
+slide_path: null  # e.g. /data/patient_001.svs
+output_dir: tile_output
+
+# "auto" runs tissue detection and connected-component tiling.
+# "manual" restricts candidate tiles to MANUAL_ROI in level-0 coordinates.
+roi_mode: auto
+
+# Used only when roi_mode: manual.
+# Set manual_roi: null to open the interactive thumbnail ROI selector.
+manual_roi:
+  x1: 18000
+  y1: 12000
+  x2: 34000
+  y2: 28000
+
+thumbnail:
+  # Larger thumbnails make tissue coverage estimates more precise but use more RAM.
+  max_size: [4096, 4096]
+  # Optional alternative to max_size, for example 64. Leave null to use max_size.
+  downsample_factor: null
+
+tissue_detection:
+  # hsv is the default because it is robust for stained tissue on white background.
+  # Other options: otsu, lab, auto.
+  method: hsv
+  hsv:
+    min_saturation: 0.08
+    min_value: 0.05
+    max_value: 0.93
+  otsu:
+    # Options: saturation, grayscale, optical_density.
+    channel: saturation
+    min_saturation: 0.04
+    max_value: 0.97
+  lab:
+    max_l: 92.0
+    min_chroma: 5.0
+
+mask_cleaning:
+  min_object_area: 256
+  fill_holes: true
+  opening_radius: 2
+  closing_radius: 4
+
+connected_components:
+  min_area: 1024
+  connectivity: 8
+
+tiling:
+  tile_size: 512
+  # stride is derived as tile_size - overlap.
+  # overlap: 0 -> stride 512; overlap: 128 -> stride 384.
+  overlap: 0
+  # Optional legacy override. If non-null with nonzero overlap, it must equal
+  # tile_size - overlap.
+  stride: null
+  # Kept for compatibility; non-aligned edge tiles are not generated because
+  # the grid must remain anchored to the ROI origin.
+  include_edge_tiles: false
+  # Applied only in manual ROI mode, after coordinate sorting and before tiling.
+  roi_padding: 0
+  min_tissue_percentage: 70.0
+  white_filter:
+    enabled: true
+    max_white_percentage: 95.0
+    min_value: 0.90
+    max_saturation: 0.12
+
+saving:
+  accepted_tiles_subdir: accepted_tiles
+  rejected_tiles_subdir: rejected_tiles
+  save_rejected_tiles: true
+  image_format: png
+  jpeg_quality: 95
+  # Resume skips existing deterministic tile filenames instead of regenerating.
+  resume: true
+  overwrite: false
+  filename_prefix: tile
+  # Keep false for stable cross-model IDs: tile_x18432_y22528.png.
+  # Set true only if you explicitly want tile_x18432_y22528_c1.png.
+  include_component_id: false
+
+metadata:
+  filename: tile_metadata.csv
+
+visualization:
+  filename: patient_tile_map.png
+  dpi: 160
+  # Set a positive integer to cap drawn rectangles on extremely large slides.
+  max_tiles_to_draw: null
+  draw_tile_labels: true
+  draw_component_labels: true
+  max_tile_labels: 300
+
+statistics:
+  filename: tile_statistics.json
+
+logging:
+  level: INFO
